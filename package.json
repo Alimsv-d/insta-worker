@@ -1,0 +1,21 @@
+{
+  "name": "insta-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Independent Instagram public-content resolver & downloader on Cloudflare Workers (no Telegram).",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node --test --test-concurrency=1 \"test/*.test.js\"",
+    "check": "node --check src/worker.js && node --check src/lib/urls.js && node --check src/lib/normalize.js && node --check src/lib/providers.js && node --check src/lib/security.js && node --check src/lib/storage.js && node --check src/lib/http.js && node --check src/lib/i18n.js && node --check src/lib/ui.js && node --test --test-concurrency=1 \"test/*.test.js\"",
+    "secret-scan": "node scripts/secret-scan.mjs"
+  },
+  "devDependencies": {
+    "parse5": "^7.1.2"
+  }
+}

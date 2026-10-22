@@ -1,0 +1,50 @@
+#:schema node_modules/wrangler/config-schema.json
+name = "insta-worker"
+main = "src/worker.js"
+compatibility_date = "2024-11-06"
+workers_dev = true
+
+# ---------------------------------------------------------------------------
+# KV namespaces (rate-limit, short-lived cache). No `id` -> auto-provisioning
+# on first `wrangler deploy` (Wrangler >= 3.60). A placeholder id keeps legacy
+# wranglers from failing; replace it with the real id in the Cloudflare
+# dashboard if auto-provisioning is unavailable.
+# ---------------------------------------------------------------------------
+[[kv_namespaces]]
+binding = "KV"
+# id = ""            # auto-provisioned on deploy
+preview_id = "insta_worker_kv_preview"
+
+# ---------------------------------------------------------------------------
+# D1 database (anonymous stats + optional API keys). No `database_id` ->
+# auto-provisioning. The schema is applied idempotently on first request.
+# ---------------------------------------------------------------------------
+[[d1_databases]]
+binding = "DB"
+database_name = "insta_worker"
+# database_id = ""   # auto-provisioned on deploy
+preview_database_id = "insta_worker_preview"
+
+[vars]
+# Ordered, comma-separated list of upstream providers. First healthy wins.
+UPSTREAM_URLS = "https://catplus.ir/api/insta"
+# Rate limits (requests per minute per IP)
+RATE_LIMIT_PER_MINUTE = "60"
+RATE_LIMIT_DOWNLOAD_PER_MINUTE = "20"
+# Hard cap for a proxied download, in megabytes
+MAX_DOWNLOAD_MB = "80"
+# Comma-separated allowlist of CDN host suffixes the proxy may fetch from.
+# Supports a leading "*." wildcard for subdomains.
+CDN_ALLOWLIST = "*.cdninstagram.com,*.fbcdn.net,*.instagram.com,*.facebook.com"
+# Contact / takedown link shown in the UI and referenced by /health
+CONTACT_URL = "https://github.com/Alimsv-d/insta-worker/issues"
+# Short cache TTL for resolved metadata, in seconds (signed links expire).
+CACHE_TTL_SECONDS = "120"
+# Per-provider upstream timeout in milliseconds
+UPSTREAM_TIMEOUT_MS = "12000"
+# Default UI / API language: fa | en
+DEFAULT_LANG = "fa"
+
+# Secrets (set with `wrangler secret put <NAME>`). Never commit values.
+# ADMIN_TOKEN                 -> protects /api/v1/admin/*
+# UPSTREAM_TOKEN              -> optional bearer token sent to upstream providers

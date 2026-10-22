@@ -1,0 +1,18 @@
+# Logs / build
+node_modules/
+.wrangler/
+dist/
+*.log
+npm-debug.log*
+
+# Secrets & local env
+.dev.vars
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,12 @@
+# Copy this file to `.dev.vars` for local `wrangler dev`.
+# NEVER commit real values. Roll any token you have ever pasted into a chat.
+
+# Protects /api/v1/admin/* (send as `Authorization: Bearer <token>`)
+ADMIN_TOKEN=
+
+# Optional bearer token forwarded to upstream providers
+UPSTREAM_TOKEN=
+
+# Optional Cloudflare API token (only needed for CI deploy, keep it as a GitHub Secret)
+CLOUDFLARE_API_TOKEN=
+CLOUDFLARE_ACCOUNT_ID=
