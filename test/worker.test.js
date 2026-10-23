@@ -468,3 +468,38 @@ test("unknown sub-paths and unhandled methods never leak internals", async () =>
   assert.equal(body.error.code, "E_METHOD");
   assert.ok(!JSON.stringify(body).includes("stack"));
 });
+
+test("download can select the second unlabeled option and streams ITS url", async () => {
+  resetProviderState();
+  const e = { ...env, KV: kvStub() };
+  const orig = globalThis.fetch;
+  const requested = [];
+  globalThis.fetch = async (u) => {
+    if (String(u).includes("/api/insta")) {
+      return upstreamJson({
+        video: [
+          { video: "https://scontent.cdninstagram.com/hd.mp4", thumbnail: "https://scontent.cdninstagram.com/t.jpg" },
+          { video: "https://scontent.cdninstagram.com/sd.mp4", thumbnail: "https://scontent.cdninstagram.com/t.jpg" },
+        ],
+      });
+    }
+    requested.push(String(u));
+    return new Response("BINARY", {
+      status: 200,
+      headers: { "content-type": "video/mp4", "content-length": "6", "accept-ranges": "bytes" },
+    });
+  };
+  try {
+    const base = "/api/v1/download?url=" + encodeURIComponent("https://www.instagram.com/reel/Opt2x/");
+    const first = await call(base + "&quality=option-1", undefined, e);
+    assert.equal(first.status, 200);
+    await first.arrayBuffer();
+    const second = await call(base + "&quality=option-2", undefined, e);
+    assert.equal(second.status, 200);
+    await second.arrayBuffer();
+    assert.ok(requested[0].endsWith("/hd.mp4"), requested[0]);
+    assert.ok(requested[1].endsWith("/sd.mp4"), requested[1]);
+  } finally {
+    globalThis.fetch = orig;
+  }
+});

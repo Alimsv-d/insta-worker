@@ -207,3 +207,42 @@ test("a single resolved item is typed by its own media kind", () => {
   const r = normalizeUpstream({ type: "video", image: ["https://scontent.cdninstagram.com/a.jpg"] }, ctx, "p");
   assert.equal(r.type, "image");
 });
+
+test("unlabeled variants of one clip get unique option-N labels (never invented resolutions)", () => {
+  const payload = {
+    video: [
+      { video: "https://scontent.cdninstagram.com/hd.mp4", thumbnail: "https://scontent.cdninstagram.com/t.jpg" },
+      { video: "https://scontent.cdninstagram.com/sd.mp4", thumbnail: "https://scontent.cdninstagram.com/t.jpg" },
+    ],
+  };
+  const r = normalizeUpstream(payload, ctx, "catplus.ir");
+  assert.equal(r.items.length, 1);
+  assert.deepEqual(
+    r.items[0].variants.map((v) => v.quality),
+    ["option-1", "option-2"],
+  );
+});
+
+test("a single unlabeled variant keeps the plain default label", () => {
+  const r = normalizeUpstream({ video: [{ video: "https://scontent.cdninstagram.com/only.mp4" }] }, ctx, "catplus.ir");
+  assert.equal(r.items[0].variants[0].quality, "default");
+});
+
+test("duplicate real labels get a numeric suffix and stay unique", () => {
+  const payload = {
+    items: [
+      {
+        type: "video",
+        variants: [
+          { url: "https://scontent.cdninstagram.com/a.mp4", quality: "720p" },
+          { url: "https://scontent.cdninstagram.com/b.mp4", quality: "720p" },
+          { url: "https://scontent.cdninstagram.com/c.mp4", quality: "480p" },
+        ],
+      },
+    ],
+  };
+  const r = normalizeUpstream(payload, ctx, "catplus.ir");
+  const labels = r.items[0].variants.map((v) => v.quality);
+  assert.deepEqual(labels, ["720p", "720p-2", "480p"]);
+  assert.equal(new Set(labels).size, labels.length);
+});

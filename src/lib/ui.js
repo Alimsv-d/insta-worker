@@ -360,7 +360,7 @@ section{padding:34px 0;scroll-margin-top:78px}
 h1{font-size:clamp(1.8rem,5vw,2.8rem);margin:.2em 0;line-height:1.3}
 h2{font-size:clamp(1.3rem,3.4vw,1.9rem);margin:.2em 0}
 h3{margin:1.3em 0 .4em}
-.lede{color:var(--muted);font-size:1.08rem;margin-top:-.3em;max-width:70ch}
+.lede{color:var(--muted);font-size:1.08rem;margin-top:.6em;max-width:70ch}
 /* Gradient text is a progressive enhancement: the fallback is an opaque colour,
    never transparent. */
 .hero h1{color:var(--brand)}
@@ -439,6 +439,14 @@ input:focus-visible,select:focus-visible,button:focus-visible,a:focus-visible{ou
 .table td:last-child{white-space:normal}
 .table th{background:color-mix(in srgb,var(--brand) 8%,transparent)}
 .table code{color:var(--brand);font-weight:700}
+/* Narrow screens: stack each row instead of squeezing the "meaning" column. */
+@media (max-width:640px){
+  .table thead{display:none}
+  .table,.table tbody,.table tr,.table td{display:block;width:100%}
+  .table tr{padding:10px 12px;border-bottom:1px solid var(--line)}
+  .table tr:last-child{border-bottom:0}
+  .table td{padding:2px 0;border:0;white-space:normal}
+}
 .faq details{border:1px solid var(--line);border-radius:12px;background:var(--card);margin-bottom:10px;padding:6px 14px}
 .faq summary{cursor:pointer;font-weight:700;padding:10px 0}
 .faq summary::marker{color:var(--brand)}
@@ -673,7 +681,10 @@ const CLIENT_JS = String.raw`(function(){
 
   // ---- result rendering ----
   function variantLabel(v){
-    var parts = [v.quality || S.quality_best || "default"];
+    var q = v.quality || S.quality_best || "default";
+    var om = /^option-(\d+)$/.exec(String(q));
+    if(om) q = (S.option_label || "Option") + " " + om[1];
+    var parts = [q];
     if(v.width && v.height) parts.push(v.width + "×" + v.height);
     var size = fmtBytes(v.size);
     if(size) parts.push(size);

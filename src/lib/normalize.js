@@ -285,6 +285,38 @@ function thumbnailOf(v) {
 }
 
 /**
+ * Make `quality` unique across the variants of ONE item (mutates in place).
+ * @param {Array<{quality:string}>} variants
+ */
+export function uniquifyQualityLabels(variants) {
+  if (!Array.isArray(variants) || variants.length < 2) return variants;
+  const counts = new Map();
+  for (const v of variants) counts.set(v.quality, (counts.get(v.quality) || 0) + 1);
+  const seen = new Map();
+  variants.forEach((v, i) => {
+    const label = v.quality;
+    if ((counts.get(label) || 0) < 2) return;
+    if (label === "default" || label === "original") {
+      v.quality = `option-${i + 1}`;
+      return;
+    }
+    const n = (seen.get(label) || 0) + 1;
+    seen.set(label, n);
+    if (n > 1) v.quality = `${label}-${n}`;
+  });
+  // A generated label could in theory collide with a real one: de-duplicate once more.
+  const used = new Set();
+  for (const v of variants) {
+    let q = v.quality;
+    let k = 2;
+    while (used.has(q)) q = `${v.quality}-${k++}`;
+    v.quality = q;
+    used.add(q);
+  }
+  return variants;
+}
+
+/**
  * Group flat upstream entries into media objects.
  * Entries that share a thumbnail, or that carry explicit quality hints, are
  * qualities of the SAME clip and end up as variants of one item.
@@ -374,6 +406,12 @@ export function normalizeUpstream(payload, ctx, provider = "upstream") {
       return true;
     });
   }
+
+  // Quality labels must be unique inside an item, otherwise the download
+  // endpoint (which selects by label) could never reach the second variant.
+  // We never invent a resolution: unlabeled variants become option-1, option-2…
+  // and repeated real labels get a numeric suffix (720p, 720p-2).
+  for (const item of items) uniquifyQualityLabels(item.variants);
 
   const usable = items.filter((i) => i.variants.length > 0);
   if (usable.length === 0) return null;
