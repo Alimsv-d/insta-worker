@@ -15,6 +15,24 @@
 
 const DEFAULT_ALLOWLIST = ["*.cdninstagram.com", "*.fbcdn.net"];
 
+/** Escape text for safe interpolation into HTML text and quoted attributes. */
+export function escapeHtml(value) {
+  return String(value == null ? "" : value).replace(/[&<>"']/g, (c) => {
+    switch (c) {
+      case "&":
+        return "&amp;";
+      case "<":
+        return "&lt;";
+      case ">":
+        return "&gt;";
+      case '"':
+        return "&quot;";
+      default:
+        return "&#39;";
+    }
+  });
+}
+
 const MAX_REDIRECT_HOPS = 3;
 const DEFAULT_MAX_BYTES = 80 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 20_000;

@@ -1,8 +1,8 @@
 # راهنمای استقرار دستی — insta-worker
 
 این راهنما برای وقتی است که نمی‌خواهید از دکمهٔ Deploy استفاده کنید. سرویس
-فقط-API است: هیچ رابط وب، D1، Cron یا Secret اجباری ندارد. هر بخش مستقل است؛
-فقط یکی از روش‌ها را انتخاب کنید.
+در مسیر `/` رابط وب دوزبانه دارد و هم‌زمان API نسخه‌دار ارائه می‌کند؛ D1، Cron
+یا Secret اجباری ندارد. هر بخش مستقل است؛ فقط یکی از روش‌ها را انتخاب کنید.
 
 > پیش‌نیاز مشترک: یک حساب Cloudflare (پلن رایگان کافی است) و یک دامنهٔ متصل به
 > همان حساب اگر می‌خواهید روی دامنهٔ خودتان سرو شود. `workers.dev` هم بدون دامنه
@@ -25,7 +25,7 @@ npx wrangler login
 بررسی سریع پروژه پیش از استقرار:
 
 ```bash
-npm run check        # سینتکس + ۹۷ تست mock
+npm run check        # بررسی سینتکس + همهٔ تست‌های mock
 npm run secret-scan  # اطمینان از نبود توکن در فایل‌ها
 npm run bundle       # ساخت dist/worker.js تک‌فایلی
 ```
@@ -38,8 +38,9 @@ npm run bundle       # ساخت dist/worker.js تک‌فایلی
 2. به Cloudflare وارد شوید و اجازهٔ دسترسی به حساب را بدهید.
 3. نام Worker را تأیید کنید (مثلاً `insta-worker`).
 4. Deploy را بزنید. هیچ فیلدی اجباری نیست و D1/دیتابیسی ساخته نمی‌شود.
-5. آدرس `https://<name>.<subdomain>.workers.dev` را باز کنید؛ پاسخ باید JSON
-   باشد، نه HTML.
+5. آدرس `https://<name>.<subdomain>.workers.dev` را در مرورگر باز کنید؛ صفحهٔ
+   وب نمایش داده می‌شود. برای خلاصهٔ JSON از `curl -H "Accept: application/json"
+   https://<name>.<subdomain>.workers.dev/` استفاده کنید.
 6. (اختیاری) در **Settings → Variables and Secrets** متغیرها یا Secretها را
    اضافه کنید (بخش ۲.۴ و ۲.۵).
 
@@ -57,8 +58,9 @@ npm run bundle       # ساخت dist/worker.js تک‌فایلی
    `dist/worker.js` را جای‌گذاری کنید (خروجی `npm run bundle`).
 4. **Deploy** کنید.
 
-> فایل `dist/worker.js` تک‌فایلی و ESM است و همهٔ ماژول‌ها را درون خود دارد.
-> هیچ فایل HTML/Asset وجود ندارد؛ `/` هم JSON برمی‌گرداند.
+> فایل `dist/worker.js` تک‌فایلی و ESM است و همهٔ ماژول‌ها، از جمله رابط وب،
+> را درون خود دارد. `/` با `Accept: text/html` صفحه و با `Accept: application/json`
+> (یا `*/*`) خلاصهٔ JSON برمی‌گرداند.
 
 ### ۲.۲ ساخت KV (محدودیت نرخ + کش)
 1. **Workers & Pages** → **KV** → **Create namespace**.
@@ -228,9 +230,12 @@ Workflow ابتدا job `check` را اجرا می‌کند (`npm ci`، `npm run
 ## ۷) چک‌لیست تأیید
 
 ```bash
-# 1) ریشه باید JSON بدهد (نه HTML)
-curl -sI "https://<worker-domain>/" | grep -iE "^(HTTP|content-type|cache-control)"
-curl -s "https://<worker-domain>/" | head -c 300
+# 1) صفحهٔ وب برای مرورگر
+curl -sI -H "Accept: text/html" "https://<worker-domain>/" | grep -iE "^(HTTP|content-type|cache-control|content-security-policy)"
+curl -s -H "Accept: text/html" "https://<worker-domain>/" | head -c 300
+
+# خلاصهٔ JSON برای API client
+curl -s -H "Accept: application/json" "https://<worker-domain>/" | head -c 300
 
 # 2) سلامت
 curl -s "https://<worker-domain>/health?deep=1"
@@ -253,7 +258,8 @@ curl -s -i "https://<worker-domain>/api/v1/resolve?url=https://www.instagram.com
 ```
 
 انتظار:
-- `/` → `200` با `content-type: application/json` و `cache-control: private, no-store`.
+- `/` با `Accept: text/html` → `200` با `content-type: text/html`, nonce CSP
+  و `cache-control: private, no-store`؛ با `Accept: application/json` → خلاصهٔ JSON.
 - `/health?deep=1` → `200` با `ok:true`، `storage.kv` و وضعیت providerها.
 - `/openapi.json` → `200` و JSON معتبر.
 - resolve → `200` با `data.items` غیرخالی یا خطای ساختاریافتهٔ روشن.

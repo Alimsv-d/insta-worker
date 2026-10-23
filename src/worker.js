@@ -1,6 +1,7 @@
 // =============================================================================
 // insta-worker — independent Instagram public-content resolver & downloader.
-// API-only Cloudflare Worker. No UI, no database, no mandatory secrets.
+// A bilingual web page plus a versioned JSON API on one Cloudflare Worker.
+// No database, no admin panel and no mandatory secrets.
 // =============================================================================
 
 import { parseInstagramUrl, buildFilename } from "./lib/urls.js";
@@ -33,7 +34,8 @@ import {
   withRequestId,
 } from "./lib/http.js";
 import { timingSafeEqual } from "./lib/crypto.js";
-import { langFromRequest } from "./lib/i18n.js";
+import { langFromRequest, uiLangFromRequest } from "./lib/i18n.js";
+import { renderHome } from "./lib/ui.js";
 
 const VERSION = "1.0.0";
 const NAME = "insta-worker";
@@ -132,16 +134,84 @@ function jsonHeaders(request, env, requestId, extra = {}) {
   return { "x-request-id": requestId, ...extra };
 }
 
+/** A cryptographically random CSP nonce for inline style and script blocks. */
+function newNonce() {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function contentSecurityPolicy(nonce) {
+  return [
+    "default-src 'none'",
+    `style-src 'nonce-${nonce}'`,
+    "style-src-attr 'none'",
+    `script-src 'nonce-${nonce}'`,
+    "script-src-attr 'none'",
+    "connect-src 'self' https://*.cdninstagram.com https://*.fbcdn.net",
+    "img-src 'self' data: https://*.cdninstagram.com https://*.fbcdn.net",
+    "media-src 'self' https://*.cdninstagram.com https://*.fbcdn.net",
+    "font-src 'self'",
+    "manifest-src 'self'",
+    "base-uri 'none'",
+    "form-action 'self'",
+    "frame-ancestors 'none'",
+    "object-src 'none'",
+  ].join("; ");
+}
+
+/**
+ * Content negotiation for GET /. Browsers send `text/html`; API clients send
+ * `application/json` (or no Accept at all). Explicit JSON wins on a tie.
+ */
+function wantsHtml(request) {
+  const accept = String(request.headers.get("accept") || "").toLowerCase();
+  const html = accept.match(/(?:^|,\s*)text\/html\s*(?:;\s*q=([0-9.]+))?\s*(?:,|$)/);
+  if (!html) return false;
+  const htmlQ = html[1] === undefined ? 1 : Number(html[1]);
+  if (!Number.isFinite(htmlQ) || htmlQ <= 0) return false;
+  const json = accept.match(/(?:^|,\s*)application\/json\s*(?:;\s*q=([0-9.]+))?\s*(?:,|$)/);
+  if (!json) return true;
+  const jsonQ = json[1] === undefined ? 1 : Number(json[1]);
+  if (!Number.isFinite(jsonQ)) return false;
+  return htmlQ > jsonQ;
+}
+
+function htmlResponse(request, env, requestId) {
+  const url = new URL(request.url);
+  const nonce = newNonce();
+  const debug = url.searchParams.get("debug") === "1";
+  const html = renderHome({
+    lang: uiLangFromRequest(request),
+    nonce,
+    build: VERSION,
+    debug,
+    origin: url.origin,
+  });
+  const headers = baseHeaders(request, env, {
+    "content-type": "text/html; charset=utf-8",
+    "cache-control": "private, no-store",
+    "content-security-policy": contentSecurityPolicy(nonce),
+    "x-frame-options": "DENY",
+    "vary": "Accept, Accept-Language",
+    "content-language": uiLangFromRequest(request),
+    "x-request-id": requestId,
+  });
+  const isHead = String(request.method || "").toUpperCase() === "HEAD";
+  return new Response(isHead ? null : html, { status: 200, headers });
+}
+
 // ---------------------------------------------------------------------------
 // Route handlers
 // ---------------------------------------------------------------------------
 
 async function handleRoot(request, env, lang, requestId) {
+  if (wantsHtml(request)) return htmlResponse(request, env, requestId);
   return jsonOk(
     {
       name: NAME,
       version: VERSION,
-      description: "Public Instagram metadata and media proxy. API-only.",
+      description: "Public Instagram metadata and media proxy with a bilingual web UI.",
       endpoints: ENDPOINTS,
       openapi: "/openapi.json",
       auth_required: parseApiKeys(env).length > 0,
@@ -402,8 +472,11 @@ function openApiDocument() {
     paths: {
       "/": {
         get: {
-          summary: "Service summary",
-          responses: { 200: { description: "Name, version, endpoint list and OpenAPI link." } },
+          summary: "Web UI or JSON service summary (content-negotiated)",
+          parameters: [
+            { name: "lang", in: "query", schema: { type: "string", enum: ["en", "fa"] }, description: "UI language; defaults to Persian for HTML." },
+          ],
+          responses: { 200: { description: "HTML for text/html clients, JSON summary otherwise." } },
         },
       },
       "/api/v1/resolve": {

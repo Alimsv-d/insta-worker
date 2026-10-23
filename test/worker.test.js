@@ -59,6 +59,79 @@ test("GET / returns a short JSON service summary", async () => {
   assert.equal(res.headers.get("x-content-type-options"), "nosniff");
 });
 
+test("GET / serves the Persian web UI to browsers", async () => {
+  const res = await call("/", { headers: { accept: "text/html" } });
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get("content-type"), /^text\/html; charset=utf-8$/);
+  assert.equal(res.headers.get("cache-control"), "private, no-store");
+  assert.equal(res.headers.get("content-language"), "fa");
+  assert.match(res.headers.get("vary"), /Accept/);
+  assert.equal(res.headers.get("x-content-type-options"), "nosniff");
+  assert.equal(res.headers.get("x-frame-options"), "DENY");
+  const csp = res.headers.get("content-security-policy");
+  assert.ok(csp);
+  assert.doesNotMatch(csp, /unsafe-inline/);
+  const nonce = csp.match(/'nonce-([^']+)'/);
+  assert.ok(nonce, "CSP must carry a nonce");
+  const html = await res.text();
+  assert.ok(html.startsWith("<!doctype html>"));
+  assert.match(html, /<html lang="fa" dir="rtl">/);
+  assert.ok(html.includes(`nonce="${nonce[1]}"`));
+  assert.match(html, /<section id="tool"/);
+  assert.match(html, /<section id="docs"/);
+  assert.doesNotMatch(html, /<script[^>]+src=/i);
+  assert.doesNotMatch(html, /style="/i);
+  assert.doesNotMatch(html, /onerror=/i);
+});
+
+test("GET /?lang=en renders the English page and keeps API text separate", async () => {
+  const res = await call("/?lang=en", { headers: { accept: "text/html" } });
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get("content-language"), "en");
+  const html = await res.text();
+  assert.match(html, /<html lang="en" dir="ltr">/);
+  assert.ok(html.includes("How it works"));
+  assert.ok(html.includes("?lang=fa"));
+  assert.ok(!html.includes("چطور کار می‌کند"));
+});
+
+test("HEAD / answers HTML headers without a body", async () => {
+  const res = await call("/", { method: "HEAD", headers: { accept: "text/html" } });
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get("content-type"), /^text\/html/);
+  const body = await res.text();
+  assert.equal(body, "");
+});
+
+test("API clients still get JSON from /, including explicit and q-value JSON", async () => {
+  for (const accept of [undefined, "*/*", "application/json", "text/html;q=0.5,application/json;q=0.9"]) {
+    const headers = accept ? { accept } : {};
+    const res = await call("/", { headers });
+    assert.equal(res.status, 200, `accept=${accept}`);
+    assert.match(res.headers.get("content-type"), /application\/json/);
+    const body = await res.json();
+    assert.equal(body.ok, true);
+    assert.equal(body.data.name, "insta-worker");
+    assert.equal(body.data.openapi, "/openapi.json");
+  }
+});
+
+test("Accept q-values pick HTML only when it is genuinely preferred", async () => {
+  const html = await call("/", { headers: { accept: "text/html;q=0.9,application/json;q=0.4" } });
+  assert.match(html.headers.get("content-type"), /text\/html/);
+  const json = await call("/", { headers: { accept: "text/html;q=0.4,application/json;q=0.9" } });
+  assert.match(json.headers.get("content-type"), /application\/json/);
+});
+
+test("debug mode is opt-in and surfaces the error panel", async () => {
+  const normal = await call("/", { headers: { accept: "text/html" } });
+  assert.doesNotMatch(await normal.text(), /id="debugPanel"/);
+  const debug = await call("/?debug=1", { headers: { accept: "text/html" } });
+  const html = await debug.text();
+  assert.match(html, /id="debugPanel"/);
+  assert.match(html, /window\.__insta/);
+});
+
 test("GET /health reports KV-only storage and no mandatory secrets", async () => {
   const res = await call("/health");
   assert.equal(res.status, 200);

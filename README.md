@@ -1,8 +1,8 @@
 # insta-worker
 
-> API-only Instagram public-content resolver and media proxy on a single
-> **Cloudflare Worker**. Public content only: no login, no cookies, no private
-> media, no UI.
+> Bilingual Instagram public-content resolver, media proxy and web UI on a
+> single **Cloudflare Worker**. Public content only: no login, no cookies, no
+> private media, no database and no mandatory secret.
 
 [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Alimsv-d/insta-worker)
 
@@ -13,15 +13,17 @@
 ## English
 
 ### What it is
-A small Cloudflare Worker with a versioned JSON API. It resolves a public
-Instagram post, reel or IGTV link into normalised metadata and streams the media
-through a hardened proxy. There is no frontend, no database and no mandatory
-secret: the Deploy button works without filling any field.
+A Cloudflare Worker with a server-rendered bilingual web page at `/` and a
+versioned JSON API under `/api/v1`. It resolves a public Instagram post, reel or
+IGTV link into normalised metadata and streams the media through a hardened
+proxy. The page defaults to Persian (RTL) with an English (LTR) switch; it loads
+no external font or script. There is no database and no mandatory secret: the
+Deploy button works without filling any field.
 
 ### API surface
 | Method | Path | Description |
 |---|---|---|
-| GET | `/` | Service name, version and endpoint list |
+| GET | `/` | Web UI for browsers (`Accept: text/html`); JSON summary otherwise |
 | GET | `/api/v1/resolve?url=&lang=` | Metadata, items and variants |
 | GET | `/api/v1/download?url=&quality=&index=&inline=&lang=` | Streamed media |
 | GET | `/api/v1/thumbnail?url=&lang=` | Image-only proxy for thumbnails |
@@ -29,10 +31,21 @@ secret: the Deploy button works without filling any field.
 | GET | `/openapi.json` | OpenAPI 3 document |
 | OPTIONS | any | CORS preflight (`204`) |
 
-`HEAD` is supported on every `GET` route. `lang` only changes API error text:
-English is the default, `?lang=fa` selects Persian.
+`HEAD` is supported on every `GET` route. Content negotiation on `/` is based on
+`Accept`: `text/html` gets the web page, `application/json` (or `*/*`, curl and
+API clients) gets the JSON summary. `?lang=en` switches the page to English;
+`?lang=fa` switches it back. API error text stays English by default; `?lang=fa`
+localises API errors.
 
 ### Features
+- **Bilingual web UI**: server-rendered Persian (default, RTL) and English (LTR),
+  responsive layout, light/dark theme, result preview, quality picker, album
+  downloads and client-side ZIP. Static content is visible without JavaScript;
+  reveal animation only arms after JS + IntersectionObserver.
+- **Strict page security**: nonce-based CSP with no `unsafe-inline`, no inline
+  handlers or style attributes, no external font/CDN, `Cache-Control:
+  private, no-store` and `X-Frame-Options: DENY` for HTML. `?debug=1` adds an
+  opt-in error panel without exposing a global bridge by default.
 - **Stable JSON envelope** for success and errors, a `request_id` in the body
   and in `X-Request-Id`, and OpenAPI at `/openapi.json`.
 - **Honest variants**: only the qualities the upstream really returns. `best`
@@ -56,7 +69,7 @@ English is the default, `?lang=fa` selects Persian.
 ### Architecture
 ```
 request ──► router (src/worker.js)
-             ├─ /                  JSON service summary
+             ├─ /                  web UI (Accept: text/html) or JSON summary
              ├─ /api/v1/resolve    metadata + variants (KV cache + ETag)
              ├─ /api/v1/download   streamed media (Range, size cap, inline)
              ├─ /api/v1/thumbnail  image-only proxy
@@ -69,6 +82,8 @@ normalize (src/lib/normalize.js): one shape for every upstream.
 security (src/lib/security.js): SSRF guards + streaming proxy.
 storage  (src/lib/storage.js): KV rate limit/cache, HMAC buckets, ETag.
 http     (src/lib/http.js): envelope, CORS, cache headers, status mapping.
+ui       (src/lib/ui.js): bilingual server-rendered page, CSS and client JS.
+i18n     (src/lib/i18n.js): API messages + UI/docs catalogues (en/fa).
 ```
 
 ### Deploy
@@ -209,7 +224,7 @@ console.log((await res.json()).data);
 ### Development
 ```bash
 npm install --no-audit --no-fund
-npm run check        # syntax checks + 97 mocked tests (no real network)
+npm run check        # syntax checks + all mocked tests (no real network)
 npm test             # tests only
 npm run bundle       # single-file dist/worker.js
 npm run dev          # wrangler dev
@@ -219,7 +234,8 @@ npm run secret-scan  # block accidental tokens before pushing
 
 The tests mock `fetch` and cover URL parsing, normalisation, provider
 timeout/fallback/breaker, SSRF and redirect rules, streaming caps and MIME
-rules, KV rate limits/cache/ETag, CORS, authentication and the HTTP routes.
+rules, KV rate limits/cache/ETag, CORS, authentication, the HTTP routes, and the
+rendered page (sections, nonce/CSP, content negotiation, i18n key parity).
 
 ### Troubleshooting
 - **401** — `API_KEYS` is set and the request has no valid `Bearer`/`x-api-key`.
@@ -249,15 +265,17 @@ MIT licensed.
 ## فارسی
 
 ### این چیست
-یک **Cloudflare Worker** کوچک با API نسخه‌دار JSON. لینک عمومی پست، ریل یا IGTV
-اینستاگرام را به متادیتای یکدست تبدیل می‌کند و رسانه را از طریق یک پروکسی امن
-استریم می‌کند. هیچ رابط وب، دیتابیس یا Secret اجباری ندارد؛ دکمهٔ Deploy بدون
-پر کردن هیچ فیلدی کار می‌کند.
+یک **Cloudflare Worker** با یک صفحهٔ وب دوزبانهٔ سمت‌سرور روی `/` و API
+نسخه‌دار JSON زیر `/api/v1`. لینک عمومی پست، ریل یا IGTV اینستاگرام را به
+متادیتای یکدست تبدیل می‌کند و رسانه را از طریق یک پروکسی امن استریم می‌کند.
+صفحه پیش‌فرض فارسی (RTL) است و با یک کلیک به انگلیسی (LTR) تغییر می‌کند؛ هیچ
+فونت یا اسکریپت خارجی بارگذاری نمی‌شود. دیتابیس و Secret اجباری ندارد؛ دکمهٔ
+Deploy بدون پر کردن هیچ فیلدی کار می‌کند.
 
 ### مسیرهای API
 | متد | مسیر | توضیح |
 |---|---|---|
-| GET | `/` | نام، نسخه و فهرست endpointها |
+| GET | `/` | رابط وب برای مرورگر (`Accept: text/html`)؛ در غیر این صورت خلاصهٔ JSON |
 | GET | `/api/v1/resolve?url=&lang=` | متادیتا، آیتم‌ها و کیفیت‌ها |
 | GET | `/api/v1/download?url=&quality=&index=&inline=&lang=` | استریم رسانه |
 | GET | `/api/v1/thumbnail?url=&lang=` | پروکسی فقط-تصویر برای تامنیل |
@@ -265,10 +283,20 @@ MIT licensed.
 | GET | `/openapi.json` | سند OpenAPI 3 |
 | OPTIONS | همه | preflight کورس (`204`) |
 
-`HEAD` روی همهٔ مسیرهای `GET` پشتیبانی می‌شود. `lang` فقط متن خطاها را عوض
-می‌کند: پیش‌فرض انگلیسی است و `?lang=fa` فارسی را انتخاب می‌کند.
+`HEAD` روی همهٔ مسیرهای `GET` پشتیبانی می‌شود. انتخاب خروجی `/` بر اساس
+`Accept` است: `text/html` صفحهٔ وب، و `application/json` (یا `*/*` و کلاینت‌های
+API) خلاصهٔ JSON. `?lang=en` صفحه را انگلیسی و `?lang=fa` آن را فارسی می‌کند.
+متن خطاهای API پیش‌فرض انگلیسی است و `?lang=fa` آن‌ها را فارسی می‌کند.
 
 ### قابلیت‌ها
+- **رابط وب دوزبانه**: رندر سمت‌سرور فارسی (پیش‌فرض، RTL) و انگلیسی (LTR)،
+  واکنش‌گرا، تم روشن/تاریک، پیش‌نمایش نتیجه، انتخاب کیفیت، دانلود آلبوم و ZIP
+  سمت کلاینت. محتوای ثابت بدون جاوااسکریپت دیده می‌شود؛ انیمیشن ظاهرشدن فقط
+  بعد از اجرای JS و وجود IntersectionObserver فعال می‌شود.
+- **امنیت سخت‌گیرانهٔ صفحه**: CSP با nonce و بدون `unsafe-inline`، بدون
+  هندلر inline یا ویژگی style، بدون فونت/CDN خارجی، `Cache-Control:
+  private, no-store` و `X-Frame-Options: DENY` برای HTML. `?debug=1` پنل خطای
+  اختیاری را فعال می‌کند و در حالت عادی هیچ bridge جهانی ساخته نمی‌شود.
 - **پاسخ JSON یکدست** برای موفقیت و خطا، `request_id` در بدنه و هدر
   `X-Request-Id`، و OpenAPI روی `/openapi.json`.
 - **کیفیت‌های صادقانه**: فقط کیفیت‌هایی که upstream واقعاً برمی‌گرداند؛ `best`
@@ -289,7 +317,7 @@ MIT licensed.
 ### معماری
 ```
 request ──► router (src/worker.js)
-             ├─ /                  خلاصهٔ JSON سرویس
+             ├─ /                  رابط وب (Accept: text/html) یا خلاصهٔ JSON
              ├─ /api/v1/resolve    متادیتا + کیفیت‌ها (کش KV + ETag)
              ├─ /api/v1/download   استریم رسانه (Range، سقف حجم، inline)
              ├─ /api/v1/thumbnail  پروکسی فقط-تصویر
@@ -302,6 +330,8 @@ normalize (src/lib/normalize.js): یک شکل یکدست برای همهٔ upstr
 security (src/lib/security.js): محافظ SSRF + پروکسی استریمی.
 storage  (src/lib/storage.js): rate limit/کش KV، bucket HMAC، ETag.
 http     (src/lib/http.js): پاکت پاسخ، کورس، هدرهای کش، نگاشت وضعیت.
+ui       (src/lib/ui.js): صفحهٔ دوزبانهٔ سمت‌سرور، CSS و JS کلاینت.
+i18n     (src/lib/i18n.js): پیام‌های API + کاتالوگ رابط و مستندات (en/fa).
 ```
 
 ### استقرار
