@@ -1,13 +1,29 @@
-// Provider layer: ordered list of upstreams with timeout, retry/backoff,
-// per-provider circuit breaker and health tracking. Returns normalised results.
+// Provider layer: ordered list of upstreams with a timeout that covers the
+// whole call (headers *and* body), retry/backoff with jitter, a per-provider
+// circuit breaker with a single half-open probe, and health tracking.
+//
+// Rules enforced here:
+//   * the timeout covers the body read as well (AbortSignal.timeout);
+//   * numeric env vars are validated (finite and > 0) before use;
+//   * the breaker is keyed by the FULL upstream URL, not only its host;
+//   * the breaker allows exactly ONE probe while half-open;
+//   * a health check never mutates breaker/health state;
+//   * UPSTREAM_TOKEN is only ever sent to the upstream it belongs to and
+//     redirects are followed manually, never automatically;
+//   * a network error is NOT "content not found";
+//   * a non-object JSON body is rejected.
 
 import { normalizeUpstream } from "./normalize.js";
 
 const DEFAULT_UPSTREAM = "https://catplus.ir/api/insta";
+const DEFAULT_TIMEOUT_MS = 12_000;
+const DEFAULT_ATTEMPTS = 2;
+const MAX_REDIRECT_HOPS = 2;
 
 const STATE = {
-  // name -> { failures, openedAt, halfOpen }
+  // full upstream URL -> { failures, openedAt, probing }
   breaker: new Map(),
+  // full upstream URL -> { ok, at }
   health: new Map(),
 };
 
@@ -16,13 +32,22 @@ const BREAKER_COOLDOWN_MS = 30_000;
 
 export function parseUpstreams(env) {
   const raw = (env && env.UPSTREAM_URLS) || DEFAULT_UPSTREAM;
-  return String(raw)
+  const list = String(raw)
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
+  const usable = list.filter((s) => {
+    try {
+      const u = new URL(s);
+      return u.protocol === "https:" || u.protocol === "http:";
+    } catch {
+      return false;
+    }
+  });
+  return usable.length ? usable : [DEFAULT_UPSTREAM];
 }
 
-function providerName(url) {
+export function providerName(url) {
   try {
     return new URL(url).hostname;
   } catch {
@@ -30,42 +55,69 @@ function providerName(url) {
   }
 }
 
-function breakerFor(name) {
-  let b = STATE.breaker.get(name);
+/** The breaker is keyed by the complete upstream URL. */
+export function breakerKey(url) {
+  return String(url || "");
+}
+
+function breakerFor(key) {
+  let b = STATE.breaker.get(key);
   if (!b) {
-    b = { failures: 0, openedAt: 0 };
-    STATE.breaker.set(name, b);
+    b = { failures: 0, openedAt: 0, probing: false };
+    STATE.breaker.set(key, b);
   }
   return b;
 }
 
-export function breakerOpen(name) {
-  const b = breakerFor(name);
+/**
+ * Pure state inspection: true while the breaker is open (and the cooldown has
+ * not elapsed). Never mutates the breaker — a health snapshot must not change
+ * the circuit state.
+ */
+export function breakerOpen(key) {
+  const b = breakerFor(key);
   if (b.failures < BREAKER_THRESHOLD) return false;
-  if (Date.now() - b.openedAt > BREAKER_COOLDOWN_MS) {
-    // half-open: allow one probe
-    b.failures = BREAKER_THRESHOLD - 1;
-    return false;
-  }
+  if (Date.now() - b.openedAt > BREAKER_COOLDOWN_MS) return false; // half-open
   return true;
 }
 
-export function recordSuccess(name) {
-  const b = breakerFor(name);
-  b.failures = 0;
-  STATE.health.set(name, { ok: true, at: Date.now() });
+/**
+ * Decide whether a request may be sent to this upstream. When the breaker is
+ * half-open exactly ONE probe is allowed; concurrent callers are rejected
+ * until that probe settles.
+ */
+export function allowProvider(key) {
+  const b = breakerFor(key);
+  if (b.failures < BREAKER_THRESHOLD) return true;
+  if (Date.now() - b.openedAt > BREAKER_COOLDOWN_MS) {
+    if (b.probing) return false;
+    b.probing = true;
+    return true;
+  }
+  return false;
 }
 
-export function recordFailure(name) {
-  const b = breakerFor(name);
+export function recordSuccess(key) {
+  const b = breakerFor(key);
+  b.failures = 0;
+  b.openedAt = 0;
+  b.probing = false;
+  STATE.health.set(key, { ok: true, at: Date.now() });
+}
+
+export function recordFailure(key) {
+  const b = breakerFor(key);
   b.failures += 1;
+  b.probing = false;
   if (b.failures >= BREAKER_THRESHOLD) b.openedAt = Date.now();
-  STATE.health.set(name, { ok: false, at: Date.now() });
+  STATE.health.set(key, { ok: false, at: Date.now() });
 }
 
 export function providerHealthSnapshot() {
   const out = {};
-  for (const [name, h] of STATE.health.entries()) out[name] = { ...h, breaker_open: breakerOpen(name) };
+  for (const [key, h] of STATE.health.entries()) {
+    out[providerName(key)] = { ...h, breaker_open: breakerOpen(key), provider: providerName(key) };
+  }
   return out;
 }
 
@@ -82,111 +134,191 @@ function buildUrl(base, target) {
   return u.toString();
 }
 
+/** Read a numeric env var: finite and > 0, otherwise the safe default. */
+export function numericEnv(env, name, fallback) {
+  const raw = env ? env[name] : undefined;
+  const n = Number(raw);
+  if (raw === undefined || raw === null || raw === "" || !Number.isFinite(n) || n <= 0) return fallback;
+  return n;
+}
+
 /**
- * Call one provider with retry/backoff. Returns {payload} or throws.
+ * The upstream bearer token is only sent to the upstream it belongs to:
+ * either the host configured in UPSTREAM_TOKEN_HOST, or — when no host is
+ * configured — the single configured upstream. With several upstreams and no
+ * explicit host the token is withheld so it can never leak to a third party.
  */
-async function callProvider(name, base, target, { fetchImpl, timeoutMs, token, attempts = 2 }) {
+export function tokenForProvider(base, env, providerCount) {
+  const token = env && env.UPSTREAM_TOKEN;
+  if (!token || typeof token !== "string") return null;
+  const host = providerName(base);
+  const allowed = env && env.UPSTREAM_TOKEN_HOST ? String(env.UPSTREAM_TOKEN_HOST).toLowerCase().replace(/\.$/, "") : null;
+  if (allowed) return host === allowed ? token : null;
+  return providerCount === 1 ? token : null;
+}
+
+function upstreamError(code, message) {
+  const err = new Error(message || code);
+  err.code = code;
+  return err;
+}
+
+/**
+ * Fetch with manual redirect handling: redirects are never followed
+ * automatically and only same-origin hops are allowed (max 2).
+ */
+async function fetchManual(url, init, fetchImpl) {
+  let current = url;
+  for (let hop = 0; hop <= MAX_REDIRECT_HOPS; hop++) {
+    const res = await fetchImpl(current, { ...init, redirect: "manual" });
+    if (res.status < 300 || res.status >= 400) return res;
+    const location = res.headers.get("location");
+    if (!location) return res;
+    let next;
+    try {
+      next = new URL(location, current).toString();
+    } catch {
+      return res;
+    }
+    try {
+      const from = new URL(current);
+      const to = new URL(next);
+      if (from.origin !== to.origin) return res;
+    } catch {
+      return res;
+    }
+    current = next;
+  }
+  throw upstreamError("E_UPSTREAM_FAILED", "too_many_redirects");
+}
+
+/**
+ * Call one provider with retry/backoff (jittered). Returns the parsed JSON or
+ * throws an error carrying a stable `code`.
+ */
+export async function callProvider(base, target, { fetchImpl, timeoutMs, token, attempts = DEFAULT_ATTEMPTS }) {
+  const url = buildUrl(base, target);
   let lastErr;
   for (let i = 0; i < attempts; i++) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const headers = { accept: "application/json", "user-agent": "insta-worker/1.0 (+https://github.com/Alimsv-d/insta-worker)" };
+      const headers = {
+        accept: "application/json",
+        "user-agent": "insta-worker/1.0 (+https://github.com/Alimsv-d/insta-worker)",
+      };
       if (token) headers.authorization = `Bearer ${token}`;
-      const res = await fetchImpl(buildUrl(base, target), { headers, signal: controller.signal, redirect: "follow" });
-      clearTimeout(timer);
-      if (res.status === 404) {
-        const err = new Error("not_found");
-        err.code = "E_PRIVATE_OR_NOT_FOUND";
-        throw err;
+
+      // The signal covers the body read as well, not only the headers.
+      const signal = AbortSignal.timeout(timeoutMs);
+      const res = await fetchManual(url, { headers, signal }, fetchImpl);
+
+      if (res.status === 404 || res.status === 410) {
+        throw upstreamError("E_PRIVATE_OR_NOT_FOUND", "not_found");
       }
-      if (!res.ok) throw new Error(`upstream_status_${res.status}`);
+      if (!res.ok) {
+        // 3xx that we did not follow, 4xx/5xx: an upstream problem, never
+        // "content not found".
+        throw upstreamError("E_UPSTREAM_FAILED", `upstream_status_${res.status}`);
+      }
+
       const text = await res.text();
       let json;
       try {
         json = JSON.parse(text);
       } catch {
-        throw new Error("upstream_bad_json");
+        throw upstreamError("E_UPSTREAM_FAILED", "upstream_bad_json");
+      }
+      if (!json || typeof json !== "object" || Array.isArray(json)) {
+        throw upstreamError("E_UPSTREAM_FAILED", "upstream_bad_shape");
       }
       return json;
     } catch (err) {
-      clearTimeout(timer);
       lastErr = err;
-      if (err.code === "E_PRIVATE_OR_NOT_FOUND") break; // no point retrying
-      if (i < attempts - 1) await sleep(200 * Math.pow(2, i));
+      if (err && err.code === "E_PRIVATE_OR_NOT_FOUND") break; // no point retrying
+      if (i < attempts - 1) {
+        // Exponential backoff with jitter.
+        const backoff = 200 * Math.pow(2, i) * (0.5 + Math.random());
+        await sleep(backoff);
+      }
     }
   }
-  throw lastErr || new Error("upstream_failed");
+  const wrapped = upstreamError(
+    lastErr && lastErr.code ? lastErr.code : "E_UPSTREAM_FAILED",
+    (lastErr && lastErr.message) || "upstream_failed",
+  );
+  if (lastErr && lastErr.code === "E_PRIVATE_OR_NOT_FOUND") throw wrapped;
+  throw wrapped;
 }
 
 /**
- * Resolve content by trying providers in order. Returns {result, provider} or null.
+ * Resolve content by trying providers in order. Returns the normalised result
+ * (which carries `provider`) or throws.
  * @param {{kind:string,shortcode:string,canonical:string}} ctx
  */
 export async function resolveContent(ctx, env, options = {}) {
   const fetchImpl = options.fetchImpl || fetch;
   const providers = options.providers || parseUpstreams(env);
-  const timeoutMs = Number((env && env.UPSTREAM_TIMEOUT_MS) || 12000);
-  const token = env && env.UPSTREAM_TOKEN;
-  const attempts = options.attempts || 2;
+  const timeoutMs = options.timeoutMs || numericEnv(env, "UPSTREAM_TIMEOUT_MS", DEFAULT_TIMEOUT_MS);
+  const attempts = options.attempts || DEFAULT_ATTEMPTS;
 
   let sawNotFound = false;
+  let sawAnyFailure = false;
 
   for (const base of providers) {
+    const key = breakerKey(base);
     const name = providerName(base);
-    if (breakerOpen(name)) continue;
+    if (!allowProvider(key)) continue;
+    const token = tokenForProvider(base, env, providers.length);
     try {
-      const payload = await callProvider(name, base, ctx.canonical, { fetchImpl, timeoutMs, token, attempts });
+      const payload = await callProvider(base, ctx.canonical, { fetchImpl, timeoutMs, token, attempts });
       const normalized = normalizeUpstream(payload, ctx, name);
       if (normalized) {
-        recordSuccess(name);
+        recordSuccess(key);
         return normalized;
       }
       // Upstream answered but with no usable media.
       sawNotFound = true;
-      recordSuccess(name);
+      recordSuccess(key);
     } catch (err) {
       if (err && err.code === "E_PRIVATE_OR_NOT_FOUND") {
         sawNotFound = true;
-        recordSuccess(name);
+        recordSuccess(key);
         continue;
       }
-      recordFailure(name);
+      // A network/timeout failure is NOT "not found".
+      sawAnyFailure = true;
+      recordFailure(key);
     }
   }
 
-  if (sawNotFound && providers.length > 0) {
-    const err = new Error("private_or_not_found");
-    err.code = "E_PRIVATE_OR_NOT_FOUND";
-    throw err;
+  if (sawNotFound && !sawAnyFailure) {
+    throw upstreamError("E_PRIVATE_OR_NOT_FOUND", "private_or_not_found");
   }
-  const err = new Error("upstream_failed");
-  err.code = "E_UPSTREAM_FAILED";
-  throw err;
+  throw upstreamError("E_UPSTREAM_FAILED", "upstream_failed");
 }
 
+/**
+ * Reachability probe. It never records success/failure: a health check must
+ * not change the circuit breaker state.
+ */
 export async function checkProviderHealth(env, options = {}) {
   const fetchImpl = options.fetchImpl || fetch;
-  const providers = parseUpstreams(env);
-  const timeoutMs = Math.min(5000, Number((env && env.UPSTREAM_TIMEOUT_MS) || 12000));
+  const providers = options.providers || parseUpstreams(env);
+  const timeoutMs = Math.min(5000, options.timeoutMs || numericEnv(env, "UPSTREAM_TIMEOUT_MS", DEFAULT_TIMEOUT_MS));
   const results = [];
   for (const base of providers) {
     const name = providerName(base);
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
     const started = Date.now();
     try {
-      // Use a well-known public reel; providers usually respond fast.
-      const res = await fetchImpl(buildUrl(base, "https://www.instagram.com/reel/DEADBEEF/"), {
-        method: "GET",
-        signal: controller.signal,
-        redirect: "follow",
-      });
-      clearTimeout(timer);
+      // A well-known public reel; providers usually respond fast.
+      const signal = AbortSignal.timeout(timeoutMs);
+      const res = await fetchManual(
+        buildUrl(base, "https://www.instagram.com/reel/DEADBEEF/"),
+        { method: "GET", signal },
+        fetchImpl,
+      );
       results.push({ provider: name, reachable: true, status: res.status, latency_ms: Date.now() - started });
     } catch (e) {
-      clearTimeout(timer);
-      results.push({ provider: name, reachable: false, error: String(e && e.message), latency_ms: Date.now() - started });
+      results.push({ provider: name, reachable: false, error: String((e && e.message) || e), latency_ms: Date.now() - started });
     }
   }
   return results;

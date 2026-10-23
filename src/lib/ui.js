@@ -1,183 +1,63 @@
-// Single-file UI (HTML + CSS + JS) rendered into the worker. No third-party
-// JS frameworks. Content is visible by default (no hidden-until-scroll or
-// hidden-until-JS sections); animations are progressive enhancements; a
-// /?debug=1 mode surfaces JS errors in a red panel.
+// Single-file UI (HTML + CSS + JS) rendered into the worker.
+//
+// Rendering rules:
+//   * the page is fully visible by default. The `js` class is added to <html>
+//     in <head>; the scroll-reveal animation is only armed when the browser
+//     actually supports IntersectionObserver (`js io`), so a browser without
+//     it (or with JS disabled) always shows the content;
+//   * a fallback timer reveals everything and is registered OUTSIDE of any
+//     error handling, so a failing feature can never leave the page hidden;
+//   * every initialisation step is wrapped in its own try/catch;
+//   * the CSP has no `unsafe-inline`: the inline <style> carries a nonce;
+//   * the webfont is loaded from a pinned CDN version with an SRI hash.
 
 import { escapeHtml } from "./security.js";
+import { uiStrings, docsFor } from "./i18n.js";
 
 const FONT_CDN = "https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css";
+// sha384 of the pinned CSS file above. The stylesheet is immutable at that
+// tag, so the hash stays valid; if it ever breaks the page falls back to the
+// system font stack.
+const FONT_SRI = "sha384-Msg4vA+dMlGceTVAySThtI+13Iz0xL9HBixehPxtwyz69HyraW1QWhcuiIqRF9Rs";
 
-const STRINGS = {
-  fa: {
-    dir: "rtl",
-    langName: "فارسی",
-    brand: "اینستا دانلودر",
-    tagline: "دانلود پست، ریل و IGTV اینستاگرام — سریع، تمیز و بدون تبلیغ",
-    nav_tool: "ابزار",
-    nav_history: "تاریخچه",
-    nav_docs: "مستندات API",
-    nav_faq: "سؤالات متداول",
-    nav_tos: "شرایط استفاده",
-    nav_about: "درباره",
-    theme_toggle: "تغییر تم",
-    lang_toggle: "English",
-    input_label: "لینک اینستاگرام",
-    input_placeholder: "https://www.instagram.com/reel/...",
-    btn_resolve: "دریافت",
-    btn_paste: "چسباندن",
-    btn_clear: "پاک کردن",
-    resolving: "در حال دریافت پیش‌نمایش…",
-    quality_label: "کیفیت / فرمت",
-    btn_download: "دانلود",
-    btn_download_all: "دانلود همه (ZIP)",
-    btn_copy: "کپی لینک",
-    btn_share: "اشتراک‌گذاری",
-    btn_report: "گزارش/حذف محتوا",
-    btn_play: "پخش پیش‌نمایش",
-    type: "نوع",
-    items: "تعداد آیتم",
-    duration: "مدت",
-    dimensions: "ابعاد",
-    file_size: "حجم تقریبی",
-    source: "لینک اصلی",
-    author: "صاحب محتوا",
-    caption: "کپشن",
-    only_one_quality: "فقط یک نسخه موجود است؛ کیفیت دیگری در دسترس نیست.",
-    best: "بهترین",
-    history_title: "تاریخچهٔ اخیر",
-    history_empty: "هنوز چیزی جستجو نکرده‌اید.",
-    history_clear: "پاک کردن تاریخچه",
-    docs_title: "مستندات API",
-    docs_intro: "این API نسخه‌دار، JSON استاندارد برمی‌گرداند و برای برنامه‌نویس‌ها رایگان است.",
-    try_it: "امتحان زنده",
-    send: "ارسال",
-    errors_table: "جدول خطاها",
-    code: "کد",
-    http: "HTTP",
-    meaning: "معنی",
-    copy_success: "کپی شد!",
-    paste_fail: "دسترسی به کلیپ‌بورد ممکن نشد.",
-    err_prefix: "خطا",
-    download: "دانلود",
-    stream_note: "دانلود از طریق همین سرویس و با پشتیبانی از Range و پخش داخل صفحه انجام می‌شود.",
-    faq_title: "سؤالات متداول",
-    tos_title: "شرایط استفاده و سلب مسئولیت (DMCA)",
-    about_title: "درباره و راه‌اندازی",
-    footer_note: "این پروژه مستقل است و به اینستاگرام وابسته یا وابسته به متا نیست.",
-    contact: "تماس/گزارش",
-    build: "نسخهٔ ساخت",
-    empty_result: "نتیجه‌ای یافت نشد.",
-    album_item: "آیتم",
-    audio_only: "فقط صدا",
-    debug_panel: "پنل خطاهای JS (debug)",
-    no_errors: "خطایی ثبت نشد.",
-    api_key: "کلید API (اختیاری)",
-    api_key_ph: "برای سقف بالاتر",
-  },
-  en: {
-    dir: "ltr",
-    langName: "English",
-    brand: "Insta Downloader",
-    tagline: "Download Instagram posts, reels and IGTV — fast, clean, ad-free",
-    nav_tool: "Tool",
-    nav_history: "History",
-    nav_docs: "API Docs",
-    nav_faq: "FAQ",
-    nav_tos: "Terms",
-    nav_about: "About",
-    theme_toggle: "Toggle theme",
-    lang_toggle: "فارسی",
-    input_label: "Instagram link",
-    input_placeholder: "https://www.instagram.com/reel/...",
-    btn_resolve: "Fetch",
-    btn_paste: "Paste",
-    btn_clear: "Clear",
-    resolving: "Fetching preview…",
-    quality_label: "Quality / format",
-    btn_download: "Download",
-    btn_download_all: "Download all (ZIP)",
-    btn_copy: "Copy link",
-    btn_share: "Share",
-    btn_report: "Report/Remove content",
-    btn_play: "Play preview",
-    type: "Type",
-    items: "Items",
-    duration: "Duration",
-    dimensions: "Dimensions",
-    file_size: "Approx. size",
-    source: "Source link",
-    author: "Author",
-    caption: "Caption",
-    only_one_quality: "Only one version is available; no other quality exists.",
-    best: "Best",
-    history_title: "Recent history",
-    history_empty: "Nothing searched yet.",
-    history_clear: "Clear history",
-    docs_title: "API Documentation",
-    docs_intro: "A versioned API returning a standard JSON envelope, free for developers.",
-    try_it: "Live try it",
-    send: "Send",
-    errors_table: "Error table",
-    code: "Code",
-    http: "HTTP",
-    meaning: "Meaning",
-    copy_success: "Copied!",
-    paste_fail: "Clipboard access was denied.",
-    err_prefix: "Error",
-    download: "Download",
-    stream_note: "Downloads are proxied through this service with Range support and in-page playback.",
-    faq_title: "FAQ",
-    tos_title: "Terms of Use & Disclaimer (DMCA)",
-    about_title: "About & Setup",
-    footer_note: "This is an independent project, not affiliated with Instagram or Meta.",
-    contact: "Contact/Report",
-    build: "Build",
-    empty_result: "No result found.",
-    album_item: "Item",
-    audio_only: "Audio only",
-    debug_panel: "JS error panel (debug)",
-    no_errors: "No errors captured.",
-    api_key: "API key (optional)",
-    api_key_ph: "For a higher limit",
-  },
-};
-
-function fmtBytes(n) {
-  if (!n || !Number.isFinite(Number(n))) return null;
-  const b = Number(n);
-  const units = ["B", "KB", "MB", "GB"];
-  let i = 0;
-  let v = b;
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024;
-    i++;
+/**
+ * Only absolute https URLs are allowed in href/src attributes.
+ * @param {string} value
+ * @param {string} fallback
+ */
+export function safeHref(value, fallback = "#") {
+  const raw = String(value == null ? "" : value).trim();
+  if (!raw) return fallback;
+  if (raw.startsWith("#")) return raw;
+  try {
+    const u = new URL(raw);
+    if (u.protocol !== "https:") return fallback;
+    return u.toString();
+  } catch {
+    return fallback;
   }
-  return `${v.toFixed(v >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
-}
-
-function scriptJson(value) {
-  // Safe embedding inside <script type="application/json">.
-  return JSON.stringify(value).replace(/</g, "\\u003c").replace(/>/g, "\\u003e").replace(/&/g, "\\u0026");
 }
 
 /**
- * @param {{lang:string, nonce:string, build:string, contact:string, defaultLang:string}} opts
+ * @param {{lang:string, nonce:string, styleNonce?:string, build:string, contact:string, defaultLang:string, debug?:boolean}} opts
  */
 export function renderHome(opts) {
-  const lang = STRINGS[opts.lang] ? opts.lang : "fa";
-  const S = STRINGS[lang];
-  const nonce = opts.nonce;
+  const lang = opts.lang === "en" ? "en" : "fa";
+  const S = uiStrings(lang);
+  const nonce = opts.nonce || "";
+  const styleNonce = opts.styleNonce || nonce;
   const build = escapeHtml(opts.build || "dev");
-  const contact = escapeHtml(opts.contact || "#");
+  const contact = safeHref(opts.contact || "", "#");
   const debug = !!opts.debug;
 
   const bootData = scriptJson({
     lang,
     defaultLang: opts.defaultLang || "fa",
     build: opts.build || "dev",
-    contact: opts.contact || "",
+    contact: contact === "#" ? "" : contact,
     debug,
     strings: S,
+    docs: docsFor(lang),
   });
 
   return `<!doctype html>
@@ -188,19 +68,21 @@ export function renderHome(opts) {
 <meta name="color-scheme" content="light dark">
 <title>${escapeHtml(S.brand)} — ${escapeHtml(S.tagline)}</title>
 <meta name="description" content="${escapeHtml(S.tagline)}">
+<meta name="referrer" content="no-referrer">
 <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
-<link rel="stylesheet" href="${FONT_CDN}">
-<style>${CSS}</style>
+<link rel="stylesheet" href="${FONT_CDN}" integrity="${FONT_SRI}" crossorigin="anonymous">
+<style nonce="${styleNonce}">${CSS}</style>
+<script nonce="${nonce}">${HEAD_JS}</script>
 </head>
 <body data-lang="${lang}">
-<a class="skip" href="#tool">${escapeHtml(S.nav_tool)}</a>
+<a class="skip" href="#tool">${escapeHtml(S.skip_to_tool)}</a>
 <header class="topbar">
   <div class="wrap row">
     <a class="brand" href="/">
       <span class="logo" aria-hidden="true">${LOGO_SVG}</span>
       <span class="brand-text"><strong>${escapeHtml(S.brand)}</strong><small>${escapeHtml(S.tagline)}</small></span>
     </a>
-    <nav class="nav" aria-label="primary">
+    <nav id="nav" class="nav" aria-label="primary">
       <a href="#tool">${escapeHtml(S.nav_tool)}</a>
       <a href="#history">${escapeHtml(S.nav_history)}</a>
       <a href="#docs">${escapeHtml(S.nav_docs)}</a>
@@ -209,6 +91,7 @@ export function renderHome(opts) {
       <a href="#about">${escapeHtml(S.nav_about)}</a>
     </nav>
     <div class="actions">
+      <button id="menuBtn" class="icon-btn nav-toggle" type="button" aria-label="${escapeHtml(S.menu_open)}" aria-expanded="false" aria-controls="nav">${ICONS.menu}</button>
       <button id="langBtn" class="icon-btn" type="button" aria-label="${escapeHtml(S.lang_toggle)}">${ICONS.globe}<span class="sr-only">${escapeHtml(S.lang_toggle)}</span></button>
       <button id="themeBtn" class="icon-btn" type="button" aria-label="${escapeHtml(S.theme_toggle)}">${ICONS.moon}<span class="sr-only">${escapeHtml(S.theme_toggle)}</span></button>
     </div>
@@ -279,7 +162,7 @@ export function renderHome(opts) {
       <tbody id="errorsBody"></tbody>
     </table></div>
 
-    <h3>Samples</h3>
+    <h3>${escapeHtml(S.samples_title)}</h3>
     <div class="samples" id="samples"></div>
   </section>
 
@@ -304,7 +187,7 @@ export function renderHome(opts) {
 
 <footer class="footer wrap">
   <p>${escapeHtml(S.footer_note)}</p>
-  <p><a href="${contact}" rel="noopener">${escapeHtml(S.contact)}</a> · ${escapeHtml(S.build)}: <code>${build}</code></p>
+  <p><a href="${escapeHtml(contact)}" rel="noopener nofollow" target="_blank">${escapeHtml(S.contact)}</a> · ${escapeHtml(S.build)}: <code>${build}</code></p>
 </footer>
 
 <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
@@ -316,12 +199,18 @@ ${debug ? `<aside id="debugPanel" class="debug"><header>${escapeHtml(S.debug_pan
 </html>`;
 }
 
+function scriptJson(value) {
+  // Safe embedding inside <script type="application/json">.
+  return JSON.stringify(value).replace(/</g, "\\u003c").replace(/>/g, "\\u003e").replace(/&/g, "\\u0026");
+}
+
 // ---------------------------------------------------------------------------
 // Inline SVG icons
 // ---------------------------------------------------------------------------
 export const ICONS = {
   globe: `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.7 2.5 15.3 0 18M12 3c-2.5 2.7-2.5 15.3 0 18"/></svg>`,
   moon: `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M21 12.8A8.5 8.5 0 1 1 11.2 3a6.5 6.5 0 0 0 9.8 9.8z"/></svg>`,
+  menu: `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg>`,
   clipboard: `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="9" y="3" width="6" height="4" rx="1"/><path d="M8 5H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2"/></svg>`,
   x: `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>`,
   search: `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>`,
@@ -358,13 +247,14 @@ body{margin:0;background:linear-gradient(180deg,var(--bg),var(--bg2));color:var(
   -webkit-font-smoothing:antialiased}
 a{color:var(--brand);text-decoration:none}
 a:hover{text-decoration:underline}
+[hidden]{display:none!important}
 .wrap{max-width:var(--max);margin:0 auto;padding:0 18px}
 .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
 .skip{position:absolute;inset-inline-start:-9999px;top:8px;background:var(--card);padding:8px 12px;border-radius:8px;z-index:50}
 .skip:focus{inset-inline-start:8px}
 .topbar{position:sticky;top:0;z-index:40;background:color-mix(in srgb,var(--bg) 82%,transparent);
   backdrop-filter:saturate(1.4) blur(10px);border-bottom:1px solid var(--line)}
-.topbar .row{display:flex;align-items:center;gap:14px;min-height:64px}
+.topbar .row{display:flex;align-items:center;gap:14px;min-height:64px;position:relative}
 .brand{display:flex;align-items:center;gap:10px;color:inherit}
 .brand-text strong{display:block;font-size:1.05rem;line-height:1.2}
 .brand-text small{display:none;color:var(--muted);font-size:.72rem}
@@ -378,12 +268,22 @@ a:hover{text-decoration:underline}
 .icon-btn{display:inline-flex;align-items:center;justify-content:center;width:42px;height:42px;
   border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:12px;cursor:pointer;transition:.2s}
 .icon-btn:hover{transform:translateY(-1px);border-color:var(--brand)}
+.nav-toggle{display:inline-flex}
+@media(min-width:900px){.nav-toggle{display:none}}
+.nav.open{display:flex;position:absolute;inset-inline:0;top:100%;flex-direction:column;gap:4px;
+  background:var(--card);border-bottom:1px solid var(--line);padding:10px 18px;box-shadow:var(--shadow)}
 section{padding:38px 0;scroll-margin-top:78px}
 h1{font-size:clamp(1.8rem,5vw,2.8rem);margin:.2em 0}
 h2{font-size:clamp(1.3rem,3.4vw,1.9rem);margin:.2em 0}
 h3{margin-top:1.4em}
 .lede{color:var(--muted);font-size:1.08rem;margin-top:-.4em}
-.hero h1{background:linear-gradient(120deg,var(--brand),var(--brand2));-webkit-background-clip:text;background-clip:text;color:transparent}
+/* Gradient text is a progressive enhancement: without background-clip the
+   headline keeps its normal colour instead of becoming invisible. */
+.hero h1{color:var(--brand)}
+@supports ((-webkit-background-clip:text) or (background-clip:text)){
+  .hero h1{background:linear-gradient(120deg,var(--brand),var(--brand2));
+    -webkit-background-clip:text;background-clip:text;color:transparent}
+}
 .card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);padding:18px}
 .tool-card{display:grid;gap:12px;margin-top:8px}
 .tool-card label{font-weight:700;font-size:.95rem}
@@ -391,6 +291,7 @@ h3{margin-top:1.4em}
 .input-row>*{flex:1 1 160px;min-width:0}
 input,select{width:100%;padding:13px 14px;border:1px solid var(--line);border-radius:12px;
   background:var(--bg2);color:var(--fg);font:inherit;transition:.2s}
+input[type=radio]{width:auto;padding:0;accent-color:var(--brand);flex:none;margin:0}
 input:focus-visible,select:focus-visible,button:focus-visible,a:focus-visible{outline:3px solid color-mix(in srgb,var(--brand) 55%,transparent);outline-offset:2px}
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:12px 16px;border-radius:12px;
   border:1px solid var(--line);background:var(--card);color:var(--fg);font:inherit;font-weight:700;cursor:pointer;transition:.2s;white-space:nowrap}
@@ -417,9 +318,10 @@ input:focus-visible,select:focus-visible,button:focus-visible,a:focus-visible{ou
 .caption{white-space:pre-wrap;word-break:break-word;color:var(--muted);max-height:9em;overflow:auto}
 .variants{display:grid;gap:10px}
 .variant{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px;border:1px solid var(--line);border-radius:12px}
-.variant .v-info{flex:1 1 180px}
+.variant label{flex:1 1 180px;cursor:pointer}
 .variant .v-info b{display:block}
 .variant .v-info span{color:var(--muted);font-size:.85rem}
+.download-row{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px}
 .album-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px}
 .album-item{border:1px solid var(--line);border-radius:12px;overflow:hidden;background:var(--bg2)}
 .album-item .thumb{aspect-ratio:1;background:#000;display:flex;align-items:center;justify-content:center}
@@ -463,39 +365,60 @@ input:focus-visible,select:focus-visible,button:focus-visible,a:focus-visible{ou
 .debug li{margin-bottom:6px;white-space:pre-wrap}
 .reveal{opacity:1;transform:none}
 @media (prefers-reduced-motion: no-preference){
-  .reveal{opacity:0;transform:translateY(14px);transition:opacity .5s ease,transform .5s ease}
-  .reveal.in{opacity:1;transform:none}
+  /* Only browsers that support IntersectionObserver AND run JS get the
+     hidden state; everything else shows the content immediately. */
+  .js.io .reveal{opacity:0;transform:translateY(14px);transition:opacity .5s ease,transform .5s ease}
+  .js.io .reveal.in{opacity:1;transform:none}
   @keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
 }
 `;
 
 const DOWNLOAD_ICON_SVG = `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 3v12m0 0l-4-4m4 4l4-4M4 21h16"/></svg>`;
 
+/**
+ * Runs in <head>, before the body is parsed. It only marks the document:
+ * `js` = JavaScript is available, `io` = IntersectionObserver is available.
+ * The CSS only hides the content when BOTH classes are present.
+ */
+const HEAD_JS = `(function(){var d=document.documentElement;d.className=(d.className+' js').trim();if('IntersectionObserver' in window){d.className=(d.className+' io').trim();}})();`;
+
 const CLIENT_JS = `
 (function(){
   "use strict";
   var ICON_DL = ${JSON.stringify(DOWNLOAD_ICON_SVG)};
   var boot = {};
-  try { boot = JSON.parse(document.getElementById('boot').textContent || '{}'); } catch(e){}
+  try { boot = JSON.parse(document.getElementById('boot').textContent || '{}'); } catch(e){ boot = {}; }
   var S = boot.strings || {};
+  var D = boot.docs || { endpoints:[], errors:[], faq:[], tos:[], about:[] };
   var debug = !!boot.debug;
   var errors = [];
+  var ZIP_CONCURRENCY = 3;
+
   function report(msg){
-    errors.push(msg);
+    errors.push(String(msg));
     if(!debug) return;
     var list = document.getElementById('debugList');
-    if(list){ var li=document.createElement('li'); li.textContent = msg; list.appendChild(li); }
+    if(list){ var li=document.createElement('li'); li.textContent = String(msg); list.appendChild(li); }
   }
+  function onError(fn){ try{ fn(); }catch(e){ report('init failed: ' + ((e && e.message) || e)); } }
+
   if(debug){
     window.addEventListener('error', function(ev){ report('Error: ' + (ev.message||'') + ' @' + (ev.filename||'') + ':' + (ev.lineno||'')); });
     window.addEventListener('unhandledrejection', function(ev){ report('UnhandledRejection: ' + (ev.reason && ev.reason.message ? ev.reason.message : ev.reason)); });
-    var dc = document.getElementById('debugClear');
-    if(dc) dc.addEventListener('click', function(){ var l=document.getElementById('debugList'); if(l) l.innerHTML=''; });
   }
-  window.__instaDebug = errors;
 
   function $(id){ return document.getElementById(id); }
   function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, function(c){ return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]; }); }
+  function safeHref(value, fallback){
+    var raw = String(value==null?'':value).trim();
+    if(!raw) return fallback || '#';
+    if(raw.charAt(0)==='#') return raw;
+    try{
+      var u = new URL(raw);
+      if(u.protocol !== 'https:') return fallback || '#';
+      return u.toString();
+    }catch(e){ return fallback || '#'; }
+  }
   function toast(msg){
     var t = $('toast'); if(!t) return;
     t.textContent = msg; t.hidden = false;
@@ -503,203 +426,190 @@ const CLIENT_JS = `
   }
   function api(path){
     return fetch(path, { headers: { 'accept': 'application/json' } }).then(function(r){
-      return r.json().then(function(j){ return { status: r.status, ok: r.ok, body: j }; });
+      return r.text().then(function(txt){
+        var body = null;
+        try{ body = txt ? JSON.parse(txt) : null; }catch(e){ body = null; }
+        return { status: r.status, ok: r.ok, body: body };
+      });
     });
   }
   function fmtBytes(n){
     if(n==null||isNaN(Number(n))) return null; var b=Number(n), u=['B','KB','MB','GB'], i=0;
     while(b>=1024&&i<u.length-1){b/=1024;i++;} return (b>=10||i===0?b.toFixed(0):b.toFixed(1))+' '+u[i];
   }
+  /**
+   * Durations may arrive in seconds or in milliseconds. Values below 1000 are
+   * seconds, everything else is milliseconds. The result is always m:ss.
+   */
   function fmtDuration(n){
-    n = Number(n); if(!isFinite(n)||n<=0) return null;
-    if(n>1000) n = n/1000; // milliseconds -> seconds
-    var s = Math.round(n), m = Math.floor(s/60), sec = s%60;
+    n = Number(n);
+    if(!isFinite(n)||n<=0) return null;
+    var secs = n >= 1000 ? n/1000 : n;
+    var s = Math.round(secs), m = Math.floor(s/60), sec = s%60;
     return m>0 ? (m+':'+(sec<10?'0':'')+sec) : (sec+'s');
   }
 
   // ---- theme ----
   function applyTheme(mode){ try{ if(mode==='dark'||mode==='light'){document.documentElement.setAttribute('data-theme',mode);} }catch(e){} }
-  try{ applyTheme(localStorage.getItem('iw-theme')); }catch(e){}
-  var themeBtn=$('themeBtn');
-  if(themeBtn) themeBtn.addEventListener('click', function(){
-    var cur = document.documentElement.getAttribute('data-theme');
-    var dark = cur ? cur==='dark' : window.matchMedia('(prefers-color-scheme: dark)').matches;
-    var next = dark ? 'light':'dark';
-    applyTheme(next);
-    try{ localStorage.setItem('iw-theme', next); }catch(e){}
+  onError(function(){ try{ applyTheme(localStorage.getItem('iw-theme')); }catch(e){} });
+  onError(function(){
+    var themeBtn=$('themeBtn');
+    if(!themeBtn) return;
+    themeBtn.addEventListener('click', function(){
+      var cur = document.documentElement.getAttribute('data-theme');
+      var dark = cur ? cur==='dark' : window.matchMedia('(prefers-color-scheme: dark)').matches;
+      var next = dark ? 'light':'dark';
+      applyTheme(next);
+      try{ localStorage.setItem('iw-theme', next); }catch(e){}
+    });
   });
 
   // ---- language ----
-  var langBtn=$('langBtn');
-  if(langBtn) langBtn.addEventListener('click', function(){
-    var cur = document.documentElement.getAttribute('lang')==='en' ? 'en':'fa';
-    var next = cur==='en' ? 'fa':'en';
-    var u = new URL(location.href); u.searchParams.set('lang', next); location.href = u.toString();
+  onError(function(){
+    var langBtn=$('langBtn');
+    if(!langBtn) return;
+    langBtn.addEventListener('click', function(){
+      var cur = document.documentElement.getAttribute('lang')==='en' ? 'en':'fa';
+      var next = cur==='en' ? 'fa':'en';
+      var u = new URL(location.href); u.searchParams.set('lang', next); location.href = u.toString();
+    });
   });
 
-  // ---- static docs content (localized) ----
-  var DOCS = {
-    fa: {
-      endpoints: [
-        ['GET /api/v1/resolve','دریافت متادیتا و لیست کیفیت‌ها','url','lang'],
-        ['GET /api/v1/download','دانلود/استریم با پشتیبانی Range','url، quality، index، lang'],
-        ['GET /api/v1/thumbnail','پروکسی امن تصویر بندانگشتی','url، lang'],
-        ['GET /health','وضعیت سرویس و providerها','-'],
-        ['GET /openapi.json','مشخصات OpenAPI','-']
-      ],
-      errors: [
-        ['E_INVALID_URL',400,'لینک نامعتبر'],['E_PRIVATE_OR_NOT_FOUND',404,'عمومی نیست یا حذف شده'],
-        ['E_UPSTREAM_FAILED',502,'خطای منبع'],['E_RATE_LIMIT',429,'محدودیت نرخ'],
-        ['E_TOO_LARGE',413,'حجم بیش از حد'],['E_NOT_ALLOWED_HOST',400,'میزبان غیرمجاز'],
-        ['E_BAD_QUALITY',400,'کیفیت نامعتبر'],['E_NOT_FOUND',404,'مسیر یافت نشد']
-      ],
-      faq: [
-        ['آیا محتوای خصوصی قابل دانلود است؟','نه. فقط پست‌ها/ریل‌های عمومی. ورود به حساب، کوکی و scraping انبوه پیاده‌سازی نشده است.'],
-        ['چرا بعضی لینک‌ها کیفیت فقط یکی دارند؟','چون منبع فقط یک نسخه برمی‌گرداند؛ ما کیفیت جعلی نمی‌سازیم و صادقانه اطلاع می‌دهیم.'],
-        ['آیا لینک‌ها دائمی‌اند؟','لینک‌های اینستاگرام امضادار و کوتاه‌عمرند؛ دانلود از طریق پروکسی همین سرویس انجام می‌شود.'],
-        ['داده‌های من ذخیره می‌شود؟','فقط آمار ناشناس (بدون IP خام، با hash). تاریخچهٔ شما فقط در مرورگر (localStorage) است.']
-      ],
-      tos: [
-        'این سرویس فقط برای مصارف شخصی و محتوای عمومی طراحی شده است.',
-        'استفاده تجاری، انبوه یا دورزدن محدودیت‌های اینستاگرام مجاز نیست.',
-        'مسئولیت رعایت حق نشر بر عهدهٔ کاربر است. نام صاحب محتوا و لینک اصلی نمایش داده می‌شود.',
-        'برای درخواست حذف (DMCA/Takedown) از لینک تماس پایین صفحه استفاده کنید.'
-      ],
-      about: [
-        'این یک Worker مستقل روی Cloudflare است و هیچ بخشی از تلگرام ندارد.',
-        'معماری: لایهٔ provider قابل‌تعویض، نرمال‌سازی پاسخ، پروکسی امن با allowlist، KV برای کش/نرخ، D1 برای آمار.',
-        'راه‌اندازی: fork کنید، Secretها را در GitHub بگذارید و با دکمهٔ Deploy یا wrangler منتشر کنید.'
-      ]
-    },
-    en: {
-      endpoints: [
-        ['GET /api/v1/resolve','Fetch metadata and quality list','url, lang'],
-        ['GET /api/v1/download','Download/stream with Range support','url, quality, index, lang'],
-        ['GET /api/v1/thumbnail','Safely proxy the thumbnail','url, lang'],
-        ['GET /health','Service and provider health','-'],
-        ['GET /openapi.json','OpenAPI specification','-']
-      ],
-      errors: [
-        ['E_INVALID_URL',400,'Invalid link'],['E_PRIVATE_OR_NOT_FOUND',404,'Not public or removed'],
-        ['E_UPSTREAM_FAILED',502,'Upstream failed'],['E_RATE_LIMIT',429,'Rate limited'],
-        ['E_TOO_LARGE',413,'Too large'],['E_NOT_ALLOWED_HOST',400,'Host not allowed'],
-        ['E_BAD_QUALITY',400,'Bad quality'],['E_NOT_FOUND',404,'Route not found']
-      ],
-      faq: [
-        ['Can private content be downloaded?','No. Only public posts/reels. No account login, cookies or bulk scraping.'],
-        ['Why does a link have only one quality?','Because the upstream returns a single version; we never invent fake qualities.'],
-        ['Are the links permanent?','Instagram links are signed and short-lived; downloads are proxied through this service.'],
-        ['Is my data stored?','Only anonymous stats (no raw IP, hashed). Your history stays in localStorage.']
-      ],
-      tos: [
-        'This service is for personal use with public content only.',
-        'Commercial or bulk use, or circumventing Instagram limits, is not allowed.',
-        'You are responsible for respecting copyright. The author name and source link are shown.',
-        'For DMCA/Takedown requests use the contact link in the footer.'
-      ],
-      about: [
-        'This is an independent Cloudflare Worker with no Telegram components.',
-        'Architecture: pluggable provider layer, response normalisation, allowlisted secure proxy, KV for cache/rate, D1 for stats.',
-        'Setup: fork, add Secrets on GitHub and deploy via the button or wrangler.'
-      ]
+  // ---- mobile menu ----
+  onError(function(){
+    var menuBtn=$('menuBtn'), nav=$('nav');
+    if(!menuBtn||!nav) return;
+    function setOpen(open){
+      nav.classList.toggle('open', open);
+      menuBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+      menuBtn.setAttribute('aria-label', open ? (S.menu_close||'') : (S.menu_open||''));
     }
-  };
-  var D = DOCS[boot.lang] || DOCS.fa;
+    menuBtn.addEventListener('click', function(){ setOpen(!nav.classList.contains('open')); });
+    nav.addEventListener('click', function(ev){ if(ev.target && ev.target.tagName==='A') setOpen(false); });
+    document.addEventListener('keydown', function(ev){ if(ev.key==='Escape') setOpen(false); });
+    window.addEventListener('resize', function(){ if(window.innerWidth>=900) setOpen(false); });
+  });
 
-  function renderStatic(){
+  // ---- static docs content (localized, comes from the server catalogue) ----
+  onError(function(){
     var ep = $('endpoints');
-    if(ep) ep.innerHTML = D.endpoints.map(function(e){
+    if(ep) ep.innerHTML = (D.endpoints||[]).map(function(e){
       return '<div class="endpoint"><code>'+esc(e[0])+'</code><p>'+esc(e[1])+'</p><p><small>'+esc(e[2])+'</small></p></div>';
     }).join('');
     var eb = $('errorsBody');
-    if(eb) eb.innerHTML = D.errors.map(function(e){ return '<tr><td><code>'+esc(e[0])+'</code></td><td>'+esc(e[1])+'</td><td>'+esc(e[2])+'</td></tr>'; }).join('');
+    if(eb) eb.innerHTML = (D.errors||[]).map(function(e){ return '<tr><td><code>'+esc(e[0])+'</code></td><td>'+esc(e[1])+'</td><td>'+esc(e[2])+'</td></tr>'; }).join('');
     var fq = $('faqList');
-    if(fq) fq.innerHTML = D.faq.map(function(f){ return '<details><summary>'+esc(f[0])+'</summary><p>'+esc(f[1])+'</p></details>'; }).join('');
+    if(fq) fq.innerHTML = (D.faq||[]).map(function(f){ return '<details><summary>'+esc(f[0])+'</summary><p>'+esc(f[1])+'</p></details>'; }).join('');
     var tb = $('tosBody');
-    if(tb) tb.innerHTML = '<ul>'+D.tos.map(function(x){ return '<li>'+esc(x)+'</li>'; }).join('')+'</ul>';
+    if(tb) tb.innerHTML = '<ul>'+(D.tos||[]).map(function(x){ return '<li>'+esc(x)+'</li>'; }).join('')+'</ul>';
     var ab = $('aboutBody');
-    if(ab) ab.innerHTML = '<ul>'+D.about.map(function(x){ return '<li>'+esc(x)+'</li>'; }).join('')+'</ul>';
+    if(ab) ab.innerHTML = '<ul>'+(D.about||[]).map(function(x){ return '<li>'+esc(x)+'</li>'; }).join('')+'</ul>';
     var sm = $('samples');
     if(sm){
       var base = location.origin;
+      var sampleUrl = base+'/api/v1/resolve?url='+encodeURIComponent('https://www.instagram.com/reel/ABC123/');
       sm.innerHTML = [
-        ['curl', 'curl "'+base+'/api/v1/resolve?url=https://www.instagram.com/reel/ABC123/"'],
+        ['curl', 'curl "'+sampleUrl+'"'],
         ['Python', 'import requests\\nr = requests.get("'+base+'/api/v1/resolve", params={"url":"https://www.instagram.com/reel/ABC123/"})\\nprint(r.json())'],
         ['PHP', '$j = file_get_contents("'+base+'/api/v1/resolve?url=".urlencode("https://www.instagram.com/reel/ABC123/"));\\necho $j;'],
-        ['JavaScript', 'const j = await (await fetch("'+base+'/api/v1/resolve?url=https://www.instagram.com/reel/ABC123/")).json();\\nconsole.log(j);'],
-        ['Node.js', 'import fetch from "node-fetch";\\nconst j = await (await fetch("'+base+'/api/v1/resolve?url=https://www.instagram.com/reel/ABC123/")).json();']
+        ['JavaScript', 'const j = await (await fetch("'+sampleUrl+'")).json();\\nconsole.log(j);'],
+        ['Node.js', 'const res = await fetch("'+sampleUrl+'");\\nconsole.log(await res.json());']
       ].map(function(s){ return '<div class="card"><b>'+esc(s[0])+'</b><pre class="code-block">'+esc(s[1])+'</pre></div>'; }).join('');
     }
-  }
-  renderStatic();
+  });
 
   // ---- reveal on scroll (progressive) ----
-  try{
+  // The fallback timer is registered BEFORE any code that can throw, so the
+  // content can never stay invisible because of a failing feature.
+  onError(function(){
     var els = document.querySelectorAll('.reveal');
-    if('IntersectionObserver' in window){
-      var io = new IntersectionObserver(function(entries){
-        entries.forEach(function(en){ if(en.isIntersecting){ en.target.classList.add('in'); io.unobserve(en.target); } });
-      }, { rootMargin: '0px 0px -10% 0px', threshold: 0.05 });
-      els.forEach(function(el){ io.observe(el); });
-      setTimeout(function(){ els.forEach(function(el){ el.classList.add('in'); }); }, 1500);
-    } else { els.forEach(function(el){ el.classList.add('in'); }); }
-  }catch(e){ document.querySelectorAll('.reveal').forEach(function(el){el.classList.add('in');}); }
+    var ioActive = false;
+    var fallback = setTimeout(function(){
+      if(ioActive) return;
+      els.forEach(function(el){ el.classList.add('in'); });
+    }, 1200);
+    try{
+      if('IntersectionObserver' in window){
+        var io = new IntersectionObserver(function(entries){
+          entries.forEach(function(en){ if(en.isIntersecting){ en.target.classList.add('in'); io.unobserve(en.target); } });
+        }, { rootMargin: '0px 0px -10% 0px', threshold: 0.05 });
+        els.forEach(function(el){ io.observe(el); });
+        ioActive = true;
+      } else {
+        els.forEach(function(el){ el.classList.add('in'); });
+      }
+    }catch(e){
+      els.forEach(function(el){ el.classList.add('in'); });
+      report('reveal failed: ' + ((e && e.message) || e));
+    }
+    window.setTimeout(function(){ clearTimeout(fallback); }, 5000);
+  });
 
   // ---- history ----
   var HK = 'iw-history';
-  function getHistory(){ try{ return JSON.parse(localStorage.getItem(HK)||'[]'); }catch(e){ return []; } }
+  function getHistory(){ try{ var v=JSON.parse(localStorage.getItem(HK)||'[]'); return Array.isArray(v)?v:[]; }catch(e){ return []; } }
   function setHistory(h){ try{ localStorage.setItem(HK, JSON.stringify(h.slice(0,20))); }catch(e){} }
-  function addHistory(item){
-    var h = getHistory().filter(function(x){ return x.shortcode !== item.shortcode; });
-    h.unshift(item); setHistory(h); renderHistory();
-  }
   function renderHistory(){
     var wrap = $('historyList'); if(!wrap) return;
     var h = getHistory();
     if(!h.length){ wrap.innerHTML = '<p class="hint">'+esc(S.history_empty)+'</p>'; return; }
     wrap.innerHTML = h.map(function(it,i){
-      return '<div class="history-card" data-i="'+i+'" role="button" tabindex="0">'+
-        (it.thumbnail ? '<img src="/api/v1/thumbnail?url='+encodeURIComponent(it.thumbnail)+'" alt="" loading="lazy" onerror="this.style.visibility=\\'hidden\\'">' : '<img alt="">')+
+      var thumb = it.thumbnail ? '<img src="/api/v1/thumbnail?url='+encodeURIComponent(it.thumbnail)+'" alt="" loading="lazy" data-fallback>' : '<img alt="" data-fallback>';
+      return '<div class="history-card" data-i="'+i+'" role="button" tabindex="0">'+ thumb +
         '<div class="hc-body"><b>@'+esc(it.author||'instagram')+'</b><small>'+esc(it.type||'')+' · '+esc(it.shortcode||'')+'</small></div></div>';
     }).join('');
+    // No inline onerror: broken thumbnails are hidden with a listener.
+    wrap.querySelectorAll('img[data-fallback]').forEach(function(img){
+      img.addEventListener('error', function(){ img.style.visibility='hidden'; });
+    });
     wrap.querySelectorAll('.history-card').forEach(function(c){
       function open(){ var it = getHistory()[Number(c.getAttribute('data-i'))]; if(it){ $('urlInput').value = it.url; resolve(); } }
       c.addEventListener('click', open);
       c.addEventListener('keydown', function(e){ if(e.key==='Enter'||e.key===' '){ e.preventDefault(); open(); } });
     });
   }
-  renderHistory();
-  var ch = $('clearHistory');
-  if(ch) ch.addEventListener('click', function(){ setHistory([]); renderHistory(); toast(S.history_clear); });
+  onError(renderHistory);
+  onError(function(){
+    var ch = $('clearHistory');
+    if(ch) ch.addEventListener('click', function(){ setHistory([]); renderHistory(); toast(S.history_clear); });
+  });
 
   // ---- resolve ----
   function variantLabel(v){
     var parts = [v.quality || 'default'];
     if(v.width && v.height) parts.push(v.width+'×'+v.height);
     var b = fmtBytes(v.size); if(b) parts.push(b);
-    if(v.mime) parts.push(v.mime.replace('video/','').replace('image/',''));
+    if(v.mime) parts.push(String(v.mime).replace('video/','').replace('image/',''));
     return parts.join(' · ');
   }
   function thumbUrl(u){ return '/api/v1/thumbnail?url=' + encodeURIComponent(u); }
-  function dlUrl(url, quality, index){ return '/api/v1/download?url='+encodeURIComponent(url)+'&quality='+encodeURIComponent(quality||'best')+'&index='+(index||0); }
+  function dlUrl(url, quality, index, inline){
+    return '/api/v1/download?url='+encodeURIComponent(url)+'&quality='+encodeURIComponent(quality||'best')+'&index='+(index||0)+(inline?'&inline=1':'');
+  }
+  function setStatus(msg, kind){ var s=$('status'); if(!s) return; s.textContent=msg||''; s.className='status'+(kind?' '+kind:''); }
+
+  var resolveSeq = 0;
+  var resolveAbort = null;
 
   function renderResult(data){
-    var box = $('result'); box.hidden = false;
+    var box = $('result'); if(!box) return;
+    box.hidden = false;
     var a = data.author || {};
     var typeMap = { video: S.type_video, image: S.type_image, album: S.type_album };
+    var sourceHref = safeHref(data.source_url, '#');
     var html = '';
     html += '<div class="card preview">';
     html += '<div class="media-box">';
-    if(data.type==='video' && data.items[0]){
+    if(data.type==='video' && data.items[0] && data.items[0].variants[0]){
       var v0 = data.items[0].variants[0];
-      html += '<video id="player" controls preload="metadata" playsinline poster="'+(data.thumbnail?esc(thumbUrl(data.thumbnail)):'')+'" src="'+esc(dlUrl(data.source_url, v0.quality, 0))+'" style="max-height:520px"></video>';
+      html += '<video id="player" controls preload="metadata" playsinline poster="'+(data.thumbnail?esc(thumbUrl(data.thumbnail)):'')+'" src="'+esc(dlUrl(data.source_url, v0.quality, 0, true))+'"></video>';
     } else if(data.thumbnail){
-      html += '<img src="'+esc(thumbUrl(data.thumbnail))+'" alt="preview" loading="lazy">';
+      html += '<img src="'+esc(thumbUrl(data.thumbnail))+' alt="preview" loading="lazy">';
     } else { html += '<div class="hint" style="padding:20px">'+esc(S.empty_result)+'</div>'; }
     html += '</div>';
     html += '<div class="meta">';
     html += '<div class="author">';
-    if(a.avatar) html += '<img src="'+esc(thumbUrl(a.avatar))+'" alt="">';
+    if(a.avatar) html += '<img src="'+esc(thumbUrl(a.avatar))+' alt="" loading="lazy">';
     html += '<div><b>@'+esc(a.username||'instagram')+'</b>'+(a.full_name?'<div class="hint">'+esc(a.full_name)+'</div>':'')+'</div></div>';
     html += '<div class="chips"><span class="pill">'+esc(typeMap[data.type]||data.type)+'</span>';
     html += '<span class="pill">'+esc(S.items)+': '+data.items.length+'</span>';
@@ -707,159 +617,326 @@ const CLIENT_JS = `
     if(data.items[0] && data.items[0].variants[0] && data.items[0].variants[0].width && data.items[0].variants[0].height) {
       html += '<span class="pill">'+esc(S.dimensions)+': '+data.items[0].variants[0].width+'×'+data.items[0].variants[0].height+'</span>';
     }
-    if(data.variants_count) html += '<span class="pill">'+data.variants_count+' variants</span>';
+    if(data.variants_count) html += '<span class="pill">'+esc(S.variants_label)+': '+data.variants_count+'</span>';
     html += '</div>';
-    html += '<div class="hint">'+esc(S.source)+': <a dir="ltr" href="'+esc(data.source_url)+'" rel="noopener nofollow" target="_blank">'+esc(data.source_url)+'</a></div>';
+    html += '<div class="hint">'+esc(S.source)+': <a dir="ltr" href="'+esc(sourceHref)+'" rel="noopener nofollow" target="_blank">'+esc(data.source_url)+'</a></div>';
     if(data.caption) html += '<div class="caption">'+esc(data.caption)+'</div>';
+
     if(data.type!=='album'){
       var item = data.items[0];
-      var many = item.variants.length > 1;
-      if(!many) html += '<p class="hint">'+esc(S.only_one_quality)+'</p>';
+      var variants = item.variants || [];
       html += '<div class="variants" role="radiogroup" aria-label="'+esc(S.quality_label)+'">';
-      item.variants.forEach(function(v, vi){
-        html += '<label class="variant"><input type="radio" name="quality" value="'+esc(v.quality)+'" data-vi="'+vi+'" '+(vi===0?'checked':'')+'>'+
-          '<span class="v-info"><b>'+esc(variantLabel(v))+'</b>'+(v.has_audio===false?'<span>'+esc(S.audio_only)+'</span>':'')+'</span>'+
-          '<a class="btn primary small" href="'+esc(dlUrl(data.source_url, v.quality, 0))+'" download="'+esc(v.filename||'media')+'">'+ICON_DL+'<span>'+esc(S.download)+'</span></a></label>';
+      variants.forEach(function(v, vi){
+        html += '<div class="variant">';
+        html += '<input type="radio" id="q'+vi+'" name="quality" value="'+esc(v.quality)+'" data-index="'+vi+'"'+(vi===0?' checked':'')+'>';
+        html += '<label for="q'+vi+'" class="v-info"><b>'+esc(variantLabel(v))+'</b>'+(v.has_audio===false?'<span>'+esc(S.audio_only)+'</span>':'')+'</label>';
+        html += '</div>';
       });
       html += '</div>';
+      if(variants.length<2) html += '<p class="hint">'+esc(S.only_one_quality)+'</p>';
+      // The download link lives OUTSIDE the labels and follows the selection.
+      html += '<div class="download-row"><a id="primaryDownload" class="btn primary" href="'+esc(dlUrl(data.source_url, variants[0].quality, 0))+'" download="'+esc(variants[0].filename||'media')+'">'+ICON_DL+'<span>'+esc(S.download)+'</span></a></div>';
     } else {
       html += '<div class="album-grid">';
       data.items.forEach(function(item, ii){
+        var v = (item.variants && item.variants[0]) || {};
         html += '<div class="album-item"><div class="thumb">';
-        if(item.type==='video') html += '<video controls preload="metadata" playsinline src="'+esc(dlUrl(data.source_url, item.variants[0].quality, ii))+'"></video>';
-        else html += '<img loading="lazy" src="'+esc(thumbUrl(item.thumbnail||item.variants[0].url))+'" alt="">';
+        if(item.type==='video') html += '<video controls preload="metadata" playsinline src="'+esc(dlUrl(data.source_url, v.quality, ii, true))+'"></video>';
+        else html += '<img loading="lazy" src="'+esc(thumbUrl(item.thumbnail||v.url))+' alt="">';
         html += '</div><div class="body"><small>'+esc(S.album_item)+' '+(ii+1)+'</small>';
-        html += '<a class="btn primary small" href="'+esc(dlUrl(data.source_url, item.variants[0].quality, ii))+'">'+ICON_DL+'<span>'+esc(S.download)+'</span></a>';
+        html += '<a class="btn primary small" href="'+esc(dlUrl(data.source_url, v.quality, ii))+'">'+ICON_DL+'<span>'+esc(S.download)+'</span></a>';
         html += '</div></div>';
       });
       html += '</div>';
-      html += '<button id="zipBtn" class="btn ghost" type="button">'+esc(S.btn_download_all)+'</button>';
+      html += '<div class="download-row"><button id="zipBtn" class="btn ghost" type="button">'+esc(S.btn_download_all)+'</button></div>';
     }
-    html += '<div class="input-row" style="margin-top:8px">';
+    html += '<div class="download-row">';
     html += '<button class="btn ghost small" id="copyBtn" type="button">'+esc(S.btn_copy)+'</button>';
     html += '<button class="btn ghost small" id="shareBtn" type="button">'+esc(S.btn_share)+'</button>';
-    html += '<a class="btn ghost small" href="'+(boot.contact?esc(boot.contact):'#')+'" rel="noopener" target="_blank">'+esc(S.btn_report)+'</a>';
+    html += '<a class="btn ghost small" href="'+esc(safeHref(boot.contact,'#'))+'" rel="noopener nofollow" target="_blank">'+esc(S.btn_report)+'</a>';
     html += '</div>';
     html += '</div></div>';
     box.innerHTML = html;
 
-    var copyBtn=$('copyBtn');
-    if(copyBtn) copyBtn.addEventListener('click', function(){
-      navigator.clipboard.writeText(data.source_url).then(function(){ toast(S.copy_success); }, function(){ toast(S.paste_fail); });
+    // The radio group really drives the download link.
+    var radios = box.querySelectorAll('input[name=quality]');
+    var primary = $('primaryDownload');
+    function syncDownload(){
+      if(!primary) return;
+      var checked = box.querySelector('input[name=quality]:checked');
+      if(!checked) return;
+      var vi = Number(checked.getAttribute('data-index'));
+      var v = (data.items[0].variants||[])[vi];
+      if(!v) return;
+      primary.setAttribute('href', dlUrl(data.source_url, v.quality, 0));
+      primary.setAttribute('download', v.filename || 'media');
+    }
+    radios.forEach(function(r){ r.addEventListener('change', syncDownload); });
+    syncDownload();
+
+    onError(function(){
+      var copyBtn=$('copyBtn');
+      if(copyBtn) copyBtn.addEventListener('click', function(){
+        if(!navigator.clipboard){ toast(S.paste_fail); return; }
+        navigator.clipboard.writeText(data.source_url).then(function(){ toast(S.copy_success); }, function(){ toast(S.paste_fail); });
+      });
     });
-    var shareBtn=$('shareBtn');
-    if(shareBtn) shareBtn.addEventListener('click', function(){
-      if(navigator.share){ navigator.share({ title: S.brand, url: data.source_url }); }
-      else { navigator.clipboard.writeText(data.source_url); toast(S.copy_success); }
+    onError(function(){
+      var shareBtn=$('shareBtn');
+      if(shareBtn) shareBtn.addEventListener('click', function(){
+        if(navigator.share){ navigator.share({ title: S.brand, url: data.source_url }); }
+        else if(navigator.clipboard){ navigator.clipboard.writeText(data.source_url).then(function(){ toast(S.copy_success); }, function(){ toast(S.paste_fail); }); }
+        else { toast(S.paste_fail); }
+      });
     });
-    var zipBtn=$('zipBtn');
-    if(zipBtn) zipBtn.addEventListener('click', function(){ downloadAlbumZip(data); });
+    onError(function(){
+      var zipBtn=$('zipBtn');
+      if(zipBtn) zipBtn.addEventListener('click', function(){ downloadAlbumZip(data); });
+    });
 
     addHistory({ shortcode:data.shortcode, url:data.source_url, author:a.username, type:data.type, thumbnail:data.thumbnail });
   }
 
-  // ---- album ZIP (browser side, no deps) ----
-  function crc32(buf){
-    var c, crc=0xffffffff;
-    for(var i=0;i<buf.length;i++){ c=(crc^buf[i])&0xff; for(var k=0;k<8;k++){ c = c&1 ? (0xEDB88320^(c>>>1)) : (c>>>1); } crc=(crc>>>8)^c; }
-    return (crc^0xffffffff)>>>0;
+  // ---- album ZIP (browser side, streaming, no dependencies) ----
+  var CRC_TABLE = (function(){
+    var table = new Uint32Array(256);
+    for(var n=0;n<256;n++){
+      var c = n;
+      for(var k=0;k<8;k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      table[n] = c >>> 0;
+    }
+    return table;
+  })();
+  function crc32Update(crc, bytes){
+    for(var i=0;i<bytes.length;i++) crc = CRC_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+    return crc >>> 0;
   }
-  function downloadAlbumZip(data){
-    toast(S.resolving);
-    var files = [];
-    var jobs = data.items.map(function(item, ii){
-      var v = item.variants[0];
-      return fetch(dlUrl(data.source_url, v.quality, ii)).then(function(r){ return r.arrayBuffer(); }).then(function(b){
-        files.push({ name: v.filename || ('item_'+(ii+1)+'.bin'), data: new Uint8Array(b) });
-      }).catch(function(){});
-    });
-    Promise.all(jobs).then(function(){
-      if(!files.length){ toast(S.empty_result); return; }
-      var parts = []; var central = []; var offset = 0;
-      var enc = new TextEncoder();
-      files.forEach(function(f){
-        var nameBytes = enc.encode(f.name);
-        var crc = crc32(f.data);
-        var local = new Uint8Array(30 + nameBytes.length);
-        var dv = new DataView(local.buffer);
-        dv.setUint32(0,0x04034b50,true); dv.setUint16(4,20,true); dv.setUint16(6,0,true); dv.setUint16(8,0,true);
-        dv.setUint16(10,0,true); dv.setUint16(12,0,true); dv.setUint32(14,crc,true);
-        dv.setUint32(18,f.data.length,true); dv.setUint32(22,f.data.length,true);
-        dv.setUint16(26,nameBytes.length,true); dv.setUint16(28,0,true);
-        local.set(nameBytes,30);
-        parts.push(local); parts.push(f.data);
-        var cen = new Uint8Array(46 + nameBytes.length);
-        var cv = new DataView(cen.buffer);
-        cv.setUint32(0,0x02014b50,true); cv.setUint16(4,20,true); cv.setUint16(6,20,true);
-        cv.setUint16(8,0,true); cv.setUint16(10,0,true); cv.setUint16(12,0,true); cv.setUint16(14,0,true);
-        cv.setUint32(16,crc,true); cv.setUint32(20,f.data.length,true); cv.setUint32(24,f.data.length,true);
-        cv.setUint16(28,nameBytes.length,true); cv.setUint16(30,0,true); cv.setUint16(32,0,true);
-        cv.setUint16(34,0,true); cv.setUint16(36,0,true); cv.setUint32(38,0,true); cv.setUint32(42,offset,true);
-        cen.set(nameBytes,46);
-        central.push(cen);
-        offset += local.length + f.data.length;
-      });
-      var centralSize = central.reduce(function(s,c){ return s+c.length; },0);
-      var end = new Uint8Array(22); var ev = new DataView(end.buffer);
-      ev.setUint32(0,0x06054b50,true); ev.setUint16(8,files.length,true); ev.setUint16(10,files.length,true);
-      ev.setUint32(12,centralSize,true); ev.setUint32(16,offset,true);
-      var all = parts.concat(central, [end]);
-      var blob = new Blob(all, { type:'application/zip' });
-      var a = document.createElement('a'); a.href = URL.createObjectURL(blob);
-      a.download = (data.author && data.author.username ? data.author.username : 'instagram') + '_' + data.shortcode + '.zip';
-      document.body.appendChild(a); a.click(); a.remove();
-      setTimeout(function(){ URL.revokeObjectURL(a.href); }, 4000);
-    });
+  function u16(v){ return new Uint8Array([v & 0xff, (v >>> 8) & 0xff]); }
+  function u32(v){ return new Uint8Array([v & 0xff, (v >>> 8) & 0xff, (v >>> 16) & 0xff, (v >>> 24) & 0xff]); }
+  function cat(arrays){
+    var len = 0, i;
+    for(i=0;i<arrays.length;i++) len += arrays[i].length;
+    var out = new Uint8Array(len), pos = 0;
+    for(i=0;i<arrays.length;i++){ out.set(arrays[i], pos); pos += arrays[i].length; }
+    return out;
+  }
+  function zipHeader(nameBytes, crc, size, offset, isCentral){
+    var head;
+    if(isCentral){
+      head = new Uint8Array(46 + nameBytes.length);
+      var dv = new DataView(head.buffer);
+      dv.setUint32(0, 0x02014b50, true);
+      dv.setUint16(4, 20, true); dv.setUint16(6, 20, true);
+      dv.setUint16(8, 0x0808, true);   // UTF-8 names + data descriptor
+      dv.setUint16(10, 0, true); dv.setUint16(12, 0, true); dv.setUint16(14, 0, true);
+      dv.setUint32(16, crc >>> 0, true);
+      dv.setUint32(20, size >>> 0, true);
+      dv.setUint32(24, size >>> 0, true);
+      dv.setUint16(28, nameBytes.length, true);
+      dv.setUint16(30, 0, true); dv.setUint16(32, 0, true);
+      dv.setUint16(34, 0, true); dv.setUint16(36, 0, true);
+      dv.setUint32(38, 0, true);
+      dv.setUint32(42, offset >>> 0, true);
+    } else {
+      head = new Uint8Array(30 + nameBytes.length);
+      var dv2 = new DataView(head.buffer);
+      dv2.setUint32(0, 0x04034b50, true);
+      dv2.setUint16(4, 20, true);
+      dv2.setUint16(6, 0x0808, true);   // UTF-8 names + data descriptor
+      dv2.setUint16(8, 0, true); dv2.setUint16(10, 0, true); dv2.setUint16(12, 0, true);
+      dv2.setUint32(14, 0, true); dv2.setUint32(18, 0, true); dv2.setUint32(22, 0, true);
+      dv2.setUint16(26, nameBytes.length, true);
+      dv2.setUint16(28, 0, true);
+    }
+    head.set(nameBytes, isCentral ? 46 : 30);
+    return head;
+  }
+  function zipDescriptor(crc, size){
+    return cat([u32(0x08074b50), u32(crc >>> 0), u32(size >>> 0), u32(size >>> 0)]);
+  }
+  function zipEnd(entries, centralSize, centralOffset){
+    var end = new Uint8Array(22);
+    var dv = new DataView(end.buffer);
+    dv.setUint32(0, 0x06054b50, true);
+    dv.setUint16(4, 0, true); dv.setUint16(6, 0, true);
+    dv.setUint16(8, entries, true); dv.setUint16(10, entries, true);
+    dv.setUint32(12, centralSize, true); dv.setUint32(16, centralOffset, true);
+    dv.setUint16(20, 0, true);
+    return end;
   }
 
-  function setStatus(msg, kind){ var s=$('status'); s.textContent=msg||''; s.className='status'+(kind?' '+kind:''); }
+  /**
+   * Download every album item and pack them into a ZIP.
+   * - at most ZIP_CONCURRENCY downloads run in parallel
+   * - the entries are written in a FIXED order (album order)
+   * - file names are written with the UTF-8 flag (0x0800)
+   * - failures are reported, the ZIP is still created from what succeeded
+   */
+  function downloadAlbumZip(data){
+    toast(S.zip_preparing);
+    var items = (data.items || []).map(function(item, ii){
+      var v = (item.variants && item.variants[0]) || {};
+      return {
+        index: ii,
+        url: dlUrl(data.source_url, v.quality, ii),
+        name: v.filename || ('item_'+(ii+1)+'.bin')
+      };
+    });
+    if(!items.length){ toast(S.empty_result); return; }
+
+    var enc = new TextEncoder();
+    var results = new Array(items.length);
+    var failed = [];
+    var next = 0;
+    var parts = [];
+    var central = [];
+    var offset = 0;
+
+    function fetchItem(item){
+      return fetch(item.url, { headers: { 'accept': '*/*' } }).then(function(res){
+        if(!res.ok) throw new Error('http_'+res.status);
+        if(!res.body || !res.body.getReader) throw new Error('no_stream');
+        var reader = res.body.getReader();
+        var chunks = [];
+        function pump(){
+          return reader.read().then(function(part){
+            if(part.done) return { chunks: chunks, size: chunks.reduce(function(s,c){ return s + c.length; }, 0) };
+            chunks.push(part.value);
+            return pump();
+          });
+        }
+        return pump();
+      });
+    }
+
+    function worker(){
+      if(next >= items.length) return Promise.resolve();
+      var item = items[next++];
+      return fetchItem(item).then(function(res){
+        results[item.index] = res;
+      }).catch(function(err){
+        failed.push(item.index);
+        report('zip item ' + item.index + ' failed: ' + ((err && err.message) || err));
+      }).then(worker);
+    }
+
+    var pool = [];
+    for(var i=0;i<Math.min(ZIP_CONCURRENCY, items.length);i++) pool.push(worker());
+
+    Promise.all(pool).then(function(){
+      var written = 0;
+      items.forEach(function(item){
+        var res = results[item.index];
+        if(!res) return;
+        var nameBytes = enc.encode(item.name);
+        var crc = 0xffffffff;
+        var size = 0;
+        res.chunks.forEach(function(c){ crc = crc32Update(crc, c); size += c.length; });
+        crc = (crc ^ 0xffffffff) >>> 0;
+        var local = zipHeader(nameBytes, 0, 0, 0, false);
+        parts.push(local);
+        res.chunks.forEach(function(c){ parts.push(c); });
+        parts.push(zipDescriptor(crc, size));
+        central.push(zipHeader(nameBytes, crc, size, offset, true));
+        offset += local.length + size + 16;
+        written++;
+      });
+      if(!written){ toast(S.zip_failed); return; }
+      var centralSize = central.reduce(function(s,c){ return s + c.length; }, 0);
+      var blob = new Blob(parts.concat(central, [zipEnd(written, centralSize, offset)]), { type: 'application/zip' });
+      var a = document.createElement('a');
+      var href = URL.createObjectURL(blob);
+      a.href = href;
+      a.download = ((data.author && data.author.username) ? data.author.username : 'instagram') + '_' + data.shortcode + '.zip';
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(function(){ URL.revokeObjectURL(href); }, 4000);
+      toast(failed.length ? S.zip_partial : S.zip_done);
+    }).catch(function(err){
+      report('zip failed: ' + ((err && err.message) || err));
+      toast(S.zip_failed);
+    });
+  }
 
   function resolve(){
-    var input = $('urlInput'); var url = (input.value||'').trim();
+    var input = $('urlInput'); if(!input) return;
+    var url = (input.value||'').trim();
     if(!url){ setStatus(S.err_prefix+': '+S.input_label, 'err'); return; }
-    setStatus(S.resolving); $('skeleton').hidden=false; $('result').hidden=true;
+    // Only the newest request may update the UI.
+    var seq = ++resolveSeq;
+    if(resolveAbort){ try{ resolveAbort.abort(); }catch(e){} }
+    var controller = typeof AbortController === 'function' ? new AbortController() : null;
+    resolveAbort = controller;
+    setStatus(S.resolving);
+    var sk = $('skeleton'); if(sk) sk.hidden=false;
+    var res = $('result'); if(res) res.hidden=true;
     var key = $('apiKeyInput') ? $('apiKeyInput').value.trim() : '';
     var headers = { 'accept':'application/json' };
     if(key) headers['x-api-key'] = key;
-    fetch('/api/v1/resolve?url='+encodeURIComponent(url), { headers: headers })
-      .then(function(r){ return r.json().then(function(j){ return { status:r.status, body:j }; }); })
-      .then(function(res){
-        $('skeleton').hidden=true;
-        if(!res.body || res.body.ok!==true){
-          var code = res.body && res.body.error ? res.body.error.code : 'E_INTERNAL';
-          var msg = res.body && res.body.error ? res.body.error.message : S.empty_result;
+    fetch('/api/v1/resolve?url='+encodeURIComponent(url), { headers: headers, signal: controller ? controller.signal : undefined })
+      .then(function(r){
+        return r.text().then(function(txt){
+          var body = null;
+          try{ body = txt ? JSON.parse(txt) : null; }catch(e){ body = null; }
+          return { status: r.status, body: body };
+        });
+      })
+      .then(function(res2){
+        if(seq !== resolveSeq) return;   // a newer request won
+        var sk2 = $('skeleton'); if(sk2) sk2.hidden=true;
+        if(!res2.body || res2.body.ok!==true){
+          var code = res2.body && res2.body.error ? res2.body.error.code : 'E_INTERNAL';
+          var msg = res2.body && res2.body.error ? res2.body.error.message : S.empty_result;
           setStatus(S.err_prefix+' '+code+': '+msg, 'err'); return;
         }
         setStatus(S.ok, 'ok');
-        renderResult(res.body.data);
-        try{ $('result').scrollIntoView({behavior:'smooth', block:'start'}); }catch(e){}
+        renderResult(res2.body.data);
+        try{ var rbox=$('result'); if(rbox) rbox.scrollIntoView({behavior:'smooth', block:'start'}); }catch(e){}
       })
-      .catch(function(err){ $('skeleton').hidden=true; setStatus(S.err_prefix+': '+err.message, 'err'); report('resolve failed: '+err.message); });
+      .catch(function(err){
+        if(seq !== resolveSeq) return;
+        var sk3 = $('skeleton'); if(sk3) sk3.hidden=true;
+        if(err && err.name === 'AbortError') return;
+        setStatus(S.err_prefix+': ' + (S.offline_hint || (err && err.message) || ''), 'err');
+        report('resolve failed: ' + ((err && err.message) || err));
+      });
   }
 
-  var form = $('resolveForm');
-  if(form) form.addEventListener('submit', function(e){ e.preventDefault(); resolve(); });
-  var pasteBtn = $('pasteBtn');
-  if(pasteBtn) pasteBtn.addEventListener('click', function(){
-    if(navigator.clipboard && navigator.clipboard.readText){
-      navigator.clipboard.readText().then(function(txt){ $('urlInput').value = txt.trim(); }, function(){ toast(S.paste_fail); });
-    } else { toast(S.paste_fail); }
+  onError(function(){
+    var form = $('resolveForm');
+    if(form) form.addEventListener('submit', function(e){ e.preventDefault(); resolve(); });
   });
-  var clearBtn = $('clearBtn');
-  if(clearBtn) clearBtn.addEventListener('click', function(){ $('urlInput').value=''; $('result').hidden=true; setStatus(''); });
+  onError(function(){
+    var pasteBtn = $('pasteBtn');
+    if(!pasteBtn) return;
+    pasteBtn.addEventListener('click', function(){
+      if(navigator.clipboard && navigator.clipboard.readText){
+        navigator.clipboard.readText().then(function(txt){ $('urlInput').value = txt.trim(); }, function(){ toast(S.paste_fail); });
+      } else { toast(S.paste_fail); }
+    });
+  });
+  onError(function(){
+    var clearBtn = $('clearBtn');
+    if(!clearBtn) return;
+    clearBtn.addEventListener('click', function(){ $('urlInput').value=''; var r=$('result'); if(r) r.hidden=true; setStatus(''); });
+  });
 
   // ---- try it ----
-  var trySend = $('trySend');
-  if(trySend) trySend.addEventListener('click', function(){
-    var ep = $('tryEndpoint').value; var u = $('tryUrl').value.trim();
-    var q = ep.indexOf('?')>=0?'&':'?';
-    var url = ep + (u? (q+'url='+encodeURIComponent(u)) : '');
-    $('tryOut').textContent = S.resolving;
-    api(url).then(function(res){ $('tryOut').textContent = JSON.stringify(res.body, null, 2); })
-      .catch(function(err){ $('tryOut').textContent = err.message; });
+  onError(function(){
+    var trySend = $('trySend');
+    if(!trySend) return;
+    trySend.addEventListener('click', function(){
+      var ep = $('tryEndpoint').value; var u = $('tryUrl').value.trim();
+      var q = ep.indexOf('?')>=0?'&':'?';
+      var url = ep + (u? (q+'url='+encodeURIComponent(u)) : '');
+      $('tryOut').textContent = S.resolving;
+      api(url).then(function(res){ $('tryOut').textContent = JSON.stringify(res.body, null, 2); })
+        .catch(function(err){ $('tryOut').textContent = (err && err.message) || S.offline_hint; });
+    });
   });
 
-  // expose for tests / debugging
-  window.__insta = { resolve: resolve, renderResult: renderResult, fmtBytes: fmtBytes };
+  // Expose the internals for tests / debugging — ONLY in debug mode.
+  if(debug){
+    window.__insta = { resolve: resolve, renderResult: renderResult, fmtBytes: fmtBytes, fmtDuration: fmtDuration, errors: errors };
+  }
 })();
 `;

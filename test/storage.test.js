@@ -52,17 +52,28 @@ test("checkRateLimit degrades without KV", async () => {
 });
 
 test("rateLimits reads env with defaults", () => {
-  assert.deepEqual(rateLimits({}), { resolve: 60, download: 20 });
-  assert.deepEqual(rateLimits({ RATE_LIMIT_PER_MINUTE: "5", RATE_LIMIT_DOWNLOAD_PER_MINUTE: "2" }), { resolve: 5, download: 2 });
+  assert.deepEqual(rateLimits({}), { resolve: 60, download: 20, thumbnail: 60, admin: 10, health: 10 });
+  assert.deepEqual(rateLimits({ RATE_LIMIT_PER_MINUTE: "5", RATE_LIMIT_DOWNLOAD_PER_MINUTE: "2" }), {
+    resolve: 5,
+    download: 2,
+    thumbnail: 60,
+    admin: 10,
+    health: 10,
+  });
+  // Invalid values fall back to the defaults instead of disabling the limit.
+  assert.deepEqual(rateLimits({ RATE_LIMIT_PER_MINUTE: "-1", RATE_LIMIT_ADMIN_PER_MINUTE: "abc" }).resolve, 60);
+  assert.deepEqual(rateLimits({ RATE_LIMIT_ADMIN_PER_MINUTE: "abc" }).admin, 10);
 });
 
-test("etag is stable and well-formed", () => {
-  const a = etagFrom({ x: 1 });
-  const b = etagFrom({ x: 1 });
-  const c = etagFrom({ x: 2 });
+test("etag is strong, stable and well-formed", async () => {
+  const a = await etagFrom({ x: 1 });
+  const b = await etagFrom({ x: 1 });
+  const c = await etagFrom({ x: 2 });
   assert.equal(a, b);
   assert.notEqual(a, c);
-  assert.match(a, /^W\/"[0-9a-f]+"$/);
+  assert.match(a, /^"sha256-[0-9a-f]{64}"$/);
+  // Strong validators must not use the weak `W/` prefix.
+  assert.ok(!a.startsWith("W/"));
 });
 
 test("sha256Hex is deterministic and 64 hex chars", async () => {
@@ -71,11 +82,21 @@ test("sha256Hex is deterministic and 64 hex chars", async () => {
   assert.equal(h, await sha256Hex("hello"));
 });
 
-test("clientKey hashes the IP (never raw)", async () => {
-  const req = new Request("https://w/", { headers: { "cf-connecting-ip": "1.2.3.4" } });
-  const key = await clientKey(req);
-  assert.ok(!key.includes("1.2.3.4"));
-  assert.equal(key.length, 64);
+test("clientKey hashes the IP (never raw) and prefixes the bucket", async () => {
+  const a = await clientKey(new Request("https://w/", { headers: { "cf-connecting-ip": "1.2.3.4" } }));
+  const b = await clientKey(new Request("https://w/", { headers: { "cf-connecting-ip": "1.2.3.4" } }));
+  const c = await clientKey(new Request("https://w/", { headers: { "cf-connecting-ip": "5.6.7.8" } }));
+  assert.ok(!a.includes("1.2.3.4"));
+  assert.match(a, /^ip:[0-9a-f]{64}$/);
+  assert.equal(a, b);
+  assert.notEqual(a, c);
+});
+
+test("clientKey never puts anonymous clients into one shared bucket", async () => {
+  const a = await clientKey(new Request("https://w/", { headers: { "user-agent": "agent-a" } }));
+  const b = await clientKey(new Request("https://w/", { headers: { "user-agent": "agent-b" } }));
+  assert.match(a, /^anon:[0-9a-f]{64}$/);
+  assert.notEqual(a, b);
 });
 
 test("ensureSchema degrades without D1", async () => {

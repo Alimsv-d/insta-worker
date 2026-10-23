@@ -1,178 +1,318 @@
-# SETUP-MANUAL — راه‌اندازی دستی کامل / Full manual setup
+# راهنمای استقرار دستی — insta-worker
 
-This guide walks through everything without the one-click button: creating the
-KV namespace and D1 database, setting variables and secrets, deploying from the
-Dashboard, from Wrangler on any OS, and notes for Android/Termux, Windows,
-Linux and cPanel.
+این راهنما برای وقتی است که نمی‌خواهید از دکمهٔ Deploy استفاده کنید. هر بخش
+مستقل است؛ فقط یکی از روش‌ها را انتخاب کنید.
 
-راهنمای کامل بدون دکمهٔ یک‌کلیکی: ساخت KV/D1، تنظیم متغیرها و Secretها،
-استقرار از Dashboard و با Wrangler روی هر سیستم‌عامل، و نکات اندروید/Termux،
-ویندوز، لینوکس و cPanel.
-
-> ⚠️ Never paste tokens into chats or screenshots. If you ever did, roll/revoke
-> them immediately before deploying.
-> ⚠️ هرگز توکن را در چت یا اسکرین‌شات نگذارید؛ اگر گذاشتید پیش از استقرار
-> فوراً Roll/Revoke کنید.
+> پیش‌نیاز مشترک: یک حساب Cloudflare (پلن رایگان کافی است) و یک دامنهٔ متصل به
+> همان حساب اگر می‌خواهید روی دامنهٔ خودتان سرو شود. `workers.dev` هم بدون دامنه
+> کار می‌کند.
 
 ---
 
-## 1) Prerequisites / پیش‌نیازها
-- A Cloudflare account with Workers enabled.
-- Node.js **20+** (CI uses 22) and npm.
-- A GitHub account (only to enable the deploy button / Actions).
+## ۰) پیش‌نیازهای محلی
+
+- Node.js **۲۰ یا بالاتر**
+- Wrangler **۳.۶۰ یا بالاتر** (برای auto-provisioning خودکار KV/D1)
 
 ```bash
-node --version   # >= 20
-npm --version
-```
-
----
-
-## 2) Create KV and D1 manually / ساخت دستی KV و D1
-
-### Dashboard
-1. **Workers & Pages → KV** → *Create namespace* → name it `insta_worker_kv`.
-   Copy the **Namespace ID**.
-2. **Workers & Pages → D1** → *Create database* → name it `insta_worker`.
-   Copy the **Database ID**.
-
-Then edit `wrangler.toml` and put the ids in:
-
-```toml
-[[kv_namespaces]]
-binding = "KV"
-id = "<your-kv-namespace-id>"
-
-[[d1_databases]]
-binding = "DB"
-database_name = "insta_worker"
-database_id = "<your-d1-database-id>"
-```
-
-On Wrangler ≥ 3.60 you may instead **omit the ids** and let `wrangler deploy`
-auto-provision them. The provided `wrangler.toml` ships with auto-provisioning
-by default.
-
-### Schema
-You do **not** need to run any SQL: the worker applies an idempotent schema
-(`stats`, `api_keys` + indexes) on the first request. If you prefer to pre-create
-it, edit `src/lib/storage.js` → `SCHEMA` and run those statements in the D1
-console. If D1 is missing or errors, the service keeps working with stats
-disabled ("degrade").
-
----
-
-## 3) Variables and secrets / متغیرها و Secretها
-
-Variables live in `wrangler.toml` under `[vars]` (or Dashboard → Worker →
-Settings → Variables). Defaults are sane; change as needed:
-`UPSTREAM_URLS`, `RATE_LIMIT_PER_MINUTE`, `RATE_LIMIT_DOWNLOAD_PER_MINUTE`,
-`MAX_DOWNLOAD_MB`, `CDN_ALLOWLIST`, `CONTACT_URL`, `CACHE_TTL_SECONDS`,
-`UPSTREAM_TIMEOUT_MS`, `DEFAULT_LANG`.
-
-Secrets (encrypted, never in git):
-```bash
-wrangler secret put ADMIN_TOKEN
-# optional
-wrangler secret put UPSTREAM_TOKEN
-```
-Or Dashboard → Worker → Settings → Variables and Secrets → *Add* → *Secret*.
-
-For local dev copy `.dev.vars.example` to `.dev.vars` and fill it in.
-
----
-
-## 4) Deploy with Wrangler / استقرار با Wrangler
-
-### Linux / macOS
-```bash
-git clone https://github.com/Alimsv-d/insta-worker.git
-cd insta-worker
+node -v
 npm install --no-audit --no-fund
-npx wrangler login          # opens browser; or use CLOUDFLARE_API_TOKEN
-npm run check               # optional: run the test suite
-npm run deploy
-```
-
-### Windows (PowerShell)
-```powershell
-git clone https://github.com/Alimsv-d/insta-worker.git
-cd insta-worker
-npm install --no-audit --no-fund
+npx wrangler --version
 npx wrangler login
-npm run deploy
 ```
 
-### Android / Termux
+بررسی سریع پروژه پیش از استقرار:
+
 ```bash
-pkg update && pkg install nodejs-lts git
-git clone https://github.com/Alimsv-d/insta-worker.git
-cd insta-worker && npm install --no-audit --no-fund
-# Browser login is awkward on Termux; use an API token instead:
-export CLOUDFLARE_API_TOKEN="<token>"
-export CLOUDFLARE_ACCOUNT_ID="<account-id>"
+npm run check        # سینتکس + ۱۱۱ تست mock
+npm run secret-scan  # اطمینان از نبود توکن در فایل‌ها
+npm run bundle       # ساخت dist/worker.js تک‌فایلی
+```
+
+---
+
+## ۱) روش الف — دکمهٔ Deploy (ساده‌ترین)
+
+1. روی دکمهٔ Deploy در `README.md` بزنید.
+2. به Cloudflare وارد شوید و اجازهٔ دسترسی به حساب را بدهید.
+3. نام Worker را تأیید کنید (مثلاً `insta-worker`).
+4. Deploy را بزنید. KV و D1 به‌صورت خودکار ساخته و bind می‌شوند.
+5. آدرس `https://<name>.<subdomain>.workers.dev` را باز کنید.
+6. Secretها را اضافه کنید (بخش ۵) و دوباره Deploy کنید.
+
+> اگر نسخهٔ Wrangler کمتر از ۳.۶۰ باشد، auto-provisioning انجام نمی‌شود و باید
+> KV/D1 را دستی بسازید (بخش ۲).
+
+---
+
+## ۲) روش ب — Dashboard (بدون CLI)
+
+### ۲.۱ ساخت Worker
+1. Cloudflare Dashboard → **Workers & Pages** → **Create** → **Worker**.
+2. نام بگذارید و **Deploy** کنید (نسخهٔ نمونه مهم نیست).
+3. وارد **Edit code** شوید، همهٔ محتوای پیش‌فرض را پاک کنید و محتوای
+   `dist/worker.js` را جای‌گذاری کنید (خروجی `npm run bundle`).
+4. **Deploy** کنید.
+
+> فایل `dist/worker.js` تک‌فایلی و ESM است و همهٔ ماژول‌ها را درون خود دارد.
+
+### ۲.۲ ساخت KV (محدودیت نرخ + کش)
+1. **Workers & Pages** → **KV** → **Create namespace**.
+2. نام: `insta-worker-cache`.
+3. به Worker برگردید → **Settings** → **Bindings** → **Add** → **KV namespace**:
+   - Variable name: `CACHE`
+   - KV namespace: همان namespace ساخته‌شده
+
+### ۲.۳ ساخت D1 (آمار و API Key)
+1. **Workers & Pages** → **D1** → **Create database**.
+2. نام: `insta-worker-db`.
+3. در صفحهٔ دیتابیس، تب **Console** را باز کنید و محتوای
+   `migrations/0001_init.sql` را اجرا کنید (یا از تب Migrations).
+4. به Worker برگردید → **Settings** → **Bindings** → **Add** → **D1 database**:
+   - Variable name: `DB`
+   - Database: `insta-worker-db`
+
+> اولین درخواست هم schema را idempotent اعمال می‌کند؛ اجرای دستی فقط برای
+> اطمینان و برای Cron است.
+
+### ۲.۴ متغیرها
+**Settings** → **Variables and Secrets** → بخش Variables:
+
+| نام | مقدار پیشنهادی |
+|---|---|
+| `UPSTREAM_URLS` | `https://catplus.ir/api/insta` |
+| `RATE_LIMIT_PER_MINUTE` | `60` |
+| `RATE_LIMIT_DOWNLOAD_PER_MINUTE` | `20` |
+| `RATE_LIMIT_THUMBNAIL_PER_MINUTE` | `60` |
+| `RATE_LIMIT_ADMIN_PER_MINUTE` | `10` |
+| `RATE_LIMIT_HEALTH_PER_MINUTE` | `10` |
+| `MAX_DOWNLOAD_MB` | `80` |
+| `CACHE_TTL_SECONDS` | `120` |
+| `UPSTREAM_TIMEOUT_MS` | `12000` |
+| `DEFAULT_LANG` | `fa` |
+| `CDN_ALLOWLIST` | `*.cdninstagram.com,*.fbcdn.net,*.instagram.com,*.facebook.com` |
+| `CONTACT_URL` | لینک تماس/حذف محتوا |
+
+### ۲.۵ Secretها
+**Settings** → **Variables and Secrets** → **Add** → نوع **Secret**:
+
+- `ADMIN_TOKEN` — یک رشتهٔ تصادفی بلند (حداقل ۳۲ کاراکتر).
+- `UPSTREAM_TOKEN` — فقط اگر provider شما توکن می‌خواهد.
+- `IP_HASH_SECRET` — یک رشتهٔ تصادفی دیگر (حداقل ۱۶ کاراکتر).
+
+ساخت مقدار تصادفی در ترمینال:
+
+```bash
+openssl rand -hex 32
+```
+
+> `IP_HASH_SECRET` را حتماً تنظیم کنید. بدون آن یک مقدار پیش‌فرض عمومی استفاده
+> می‌شود و bucketهای IP بین deploymentها قابل مقایسه می‌شوند.
+
+### ۲.۶ Cron (پاکسازی آمار)
+در Dashboard برای Worker → **Settings** → **Triggers** → **Cron Triggers** →
+`0 3 * * *` را اضافه کنید. این کار رکوردهای قدیمی `stats` را روزانه پاک می‌کند.
+
+---
+
+## ۳) روش ج — Wrangler CLI
+
+```bash
+npx wrangler login
+npx wrangler kv namespace create CACHE
+npx wrangler d1 create insta-worker-db
+npx wrangler d1 migrations apply insta-worker-db --remote
+npx wrangler secret put ADMIN_TOKEN
+npx wrangler secret put IP_HASH_SECRET
+# اختیاری:
+# npx wrangler secret put UPSTREAM_TOKEN
 npx wrangler deploy
 ```
 
-### cPanel / shared hosting (Node is present)
-Shared hosts usually cannot run a long-lived process, but you only need the CLI
-to push a deploy (the worker runs on Cloudflare):
-```bash
-# from a shell inside your home dir
-npm install --no-audit --no-fund
-CLOUDFLARE_API_TOKEN=<token> CLOUDFLARE_ACCOUNT_ID=<id> npx wrangler deploy
+سپس `wrangler.toml` را باز کنید و شناسه‌های واقعی را جای‌گذاری کنید:
+
+```toml
+[[kv_namespaces]]
+binding = "CACHE"
+id = "<KV_NAMESPACE_ID>"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "insta-worker-db"
+database_id = "<D1_DATABASE_ID>"
+migrations_dir = "migrations"
 ```
-If `npm install` is not possible, build locally and upload `worker.js` as a
-single-file Worker via the Dashboard (the UI, API and providers are all in
-`src/`, so prefer the Dashboard "Quick edit" only for the bundler-free path).
 
----
+> در `wrangler.toml` هیچ `preview_id` یا `preview_database_id` ساختگی نگذارید؛
+> Wrangler جدید خودش پیش‌نمایش محلی را مدیریت می‌کند. اگر از `wrangler dev`
+> استفاده می‌کنید و خطای binding گرفتید، بخش `[env.preview]` را فقط در صورت
+> نیاز اضافه کنید.
 
-## 5) Deploy from the Dashboard / استقرار از Dashboard
-1. Workers & Pages → *Create* → *Worker*.
-2. Name it `insta-worker` and create.
-3. Replace the code with the bundled worker (Dashboard → *Edit code*). Because
-   the project is multi-file ES modules, the cleanest path is *Upload* with the
-   built bundle, or bind a GitHub repo:
-   **Worker → Settings → Build → Connect a repository** and pick your fork.
-4. Add the KV/D1 bindings, variables and secrets from sections 2–3.
-5. Save and Deploy.
-
----
-
-## 6) GitHub Actions (optional CI deploy)
-1. Repo → **Settings → Secrets and variables → Actions**.
-2. Add `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`.
-3. Run the **Deploy to Cloudflare Workers** workflow manually.
-   If the secrets are missing the workflow prints a clear warning and skips the
-   deploy (it does not fail silently).
-
----
-
-## 7) Verify / بررسی
+بررسی سلامت و لاگ:
 
 ```bash
-curl https://<worker>/health
-curl "https://<worker>/api/v1/resolve?url=https://www.instagram.com/reel/ABC123/&lang=en"
+npx wrangler tail
+curl -s "https://<worker-domain>/health?deep=1" | head -c 800
 ```
-Open `https://<worker>/` for the UI and `https://<worker>/?debug=1` to surface
-JS errors in a red panel.
 
 ---
 
-## 8) Rotating compromised tokens / چرخش توکن‌های لو رفته
-- **Cloudflare**: My Profile → API Tokens → *Roll* / *Delete* the leaked token,
-  then update the GitHub Secret and `wrangler secret put`.
-- **Telegram** (if you ever had a bot token exposed): message **@BotFather** →
-  `/revoke` and pick the bot.
-- After rotating, re-deploy and confirm `/health`.
+## ۴) روش د — اتصال GitHub به Cloudflare (بدون Actions)
+
+1. مخزن را به GitHub push کنید (بدون Secret).
+2. Cloudflare Dashboard → **Workers & Pages** → **Create** → **Connect to Git**.
+3. مخزن و شاخهٔ `main` را انتخاب کنید.
+4. Build command را خالی بگذارید و Deploy command را
+   `npx wrangler deploy` قرار دهید (یا مطابق تنظیمات پروژه).
+5. KV/D1 را در **Settings → Bindings** وصل کنید و متغیرها/Secretها را وارد کنید.
+6. هر push به `main` خودکار deploy می‌شود.
+
+> اگر می‌خواهید فقط با تگ/دستی deploy شود، در تنظیمات Git integration شاخه را
+> عوض کنید یا از روش ه (Actions) استفاده کنید.
 
 ---
 
-## 9) What to test by hand / چه چیزی را دستی تست کنید
-Automated tests mock the network. On a real deployment, please verify:
-- A real reel/post/album resolves and the preview, caption and author show.
-- Quality selection and a real download (check the filename and Range/seek).
-- Album ZIP in a real browser.
-- `/health`, `/?debug=1`, rate limiting (429 + `Retry-After`) and the error codes.
-- RTL/LTR and light/dark in a real browser and on a phone.
+## ۵) روش ه — GitHub Actions
+
+فایل `.github/workflows/deploy.yml` فقط با **workflow_dispatch** اجرا می‌شود و
+اگر Secretها ناقص باشند با خطای صریح متوقف می‌شود (deploy سبزِ الکی نداریم).
+
+### ۵.۱ ساخت API Token در Cloudflare
+**My Profile** → **API Tokens** → **Create Token** → **Custom token**:
+
+- Permissions:
+  - `Account` → `Workers Scripts` → **Edit**
+  - `Account` → `Workers KV Storage` → **Edit**
+  - `Account` → `D1` → **Edit**
+  - `Account` → `Account Settings` → **Read** (برای Account ID)
+- Account Resources: حساب خودتان
+- Zone Resources: فقط اگر از Custom Domain/Route استفاده می‌کنید، Zone مربوطه
+  با `Workers Routes` → **Edit**
+
+### ۵.۲ Secretهای GitHub
+**Settings** → **Secrets and variables** → **Actions** → **New repository secret**:
+
+| نام | مقدار |
+|---|---|
+| `CLOUDFLARE_API_TOKEN` | توکن بخش ۵.۱ |
+| `CLOUDFLARE_ACCOUNT_ID` | از Dashboard → Workers → Account ID |
+| `ADMIN_TOKEN` | همان مقدار Secret ورکر |
+| `IP_HASH_SECRET` | همان مقدار Secret ورکر |
+| `UPSTREAM_TOKEN` | اختیاری |
+
+> Workflow این مقادیر را با `wrangler secret put` روی Worker تنظیم می‌کند؛
+> لازم نیست جداگانه در Dashboard وارد شوند.
+
+### ۵.۳ Environment
+یک Environment به نام `production` بسازید (Settings → Environments) و در صورت
+نیاز Reviewer یا محدودیت شاخه را فعال کنید. Workflow به همین environment وصل
+است.
+
+### ۵.۴ اجرا
+**Actions** → **Deploy to Cloudflare** → **Run workflow** → شاخهٔ `main`.
+
+Workflow ابتدا job `check` را اجرا می‌کند (`npm ci`، `npm run check`،
+`npm run secret-scan`) و فقط در صورت موفقیت deploy می‌کند.
+
+---
+
+## ۶) تنظیم دامنه
+
+1. Worker → **Settings** → **Domains & Routes** → **Add** → **Custom domain**.
+2. دامنه/زیردامنه را وارد کنید (DNS باید در همان حساب Cloudflare باشد).
+3. منتظر صدور گواهی بمانید و سپس باز کنید.
+
+برای مسیر روی دامنهٔ موجود: **Add route** با الگوی
+`example.com/instagram/*` و Zone مناسب. در این حالت Worker فقط روی همان مسیر
+اجرا می‌شود.
+
+---
+
+## ۷) چک‌لیست تأیید
+
+```bash
+# 1) صفحهٔ اصلی (باید 200 و CSP بدون unsafe-inline بدهد)
+curl -sI "https://<worker-domain>/" | grep -iE "^(HTTP|content-security-policy|cache-control)"
+
+# 2) سلامت
+curl -s "https://<worker-domain>/health?deep=1"
+
+# 3) سند API
+curl -s "https://<worker-domain>/openapi.json" | head -c 300
+
+# 4) resolve یک لینک عمومی
+curl -s "https://<worker-domain>/api/v1/resolve?url=https://www.instagram.com/reel/ABC123/"
+
+# 5) محدودیت نرخ (باید 429 با Retry-After بدهد)
+for i in $(seq 1 70); do curl -s -o /dev/null -w "%{http_code}\n" \
+  "https://<worker-domain>/api/v1/resolve?url=https://www.instagram.com/reel/ABC123/"; done | sort | uniq -c
+
+# 6) ادمین بدون توکن (باید 401 بدهد)
+curl -s -i "https://<worker-domain>/api/v1/admin/keys" | head -5
+
+# 7) ادمین با توکن
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
+  "https://<worker-domain>/api/v1/admin/keys"
+```
+
+انتظار:
+- `/` → `200`, `cache-control: private, no-store`, CSP شامل `nonce-...` و بدون
+  `unsafe-inline`.
+- `/health?deep=1` → `200` با `ok:true` و وضعیت providerها.
+- `/openapi.json` → `200` و JSON معتبر.
+- resolve → `200` با `data.variants` غیرخالی یا خطای ساختاریافتهٔ روشن.
+- درخواست‌های بیش از سقف → `429` و هدر `Retry-After`.
+- ادمین بدون توکن → `401`؛ با توکن → `200`.
+
+---
+
+## ۸) چرخش (Rotate) Secretها
+
+اگر توکنی لو رفت:
+
+1. Cloudflare → **My Profile** → **API Tokens** → توکن مربوطه → **Roll/Delete**.
+2. GitHub → **Settings → Secrets** → مقدار جدید را ذخیره کنید.
+3. روی Worker:
+   ```bash
+   npx wrangler secret put ADMIN_TOKEN
+   npx wrangler secret put IP_HASH_SECRET
+   ```
+4. اگر `UPSTREAM_TOKEN` لو رفته، آن را در پنل provider هم باطل کنید.
+5. لاگ‌ها را بررسی کنید: `npx wrangler tail`.
+
+> Secretها را در چت، اسکرین‌شات، Issue یا فایل `.dev.vars` داخل مخزن نگذارید.
+> `.dev.vars` در `.gitignore` است.
+
+---
+
+## ۹) عیب‌یابی
+
+| نشانه | علت محتمل | راه‌حل |
+|---|---|---|
+| `500` روی همهٔ مسیرها | binding یا schema ناقص | `/health?deep=1` و لاگ `wrangler tail` |
+| `E_UPSTREAM_FAILED` | provider قطع/تغییر شکل پاسخ | `UPSTREAM_URLS` و health عمیق |
+| `E_NOT_ALLOWED_HOST` | CDN در allowlist نیست | `CDN_ALLOWLIST` را به‌روز کنید |
+| `429` زودهنگام | سقف پایین یا IP مشترک | سقف را بالا ببرید یا API Key بسازید |
+| صفحه بدون استایل | CSP یا nonce اشتباه | `/?debug=1` و CSP پاسخ را ببینید |
+| دانلود نیمه‌کاره | سقف `MAX_DOWNLOAD_MB` یا timeout | سقف/`UPSTREAM_TIMEOUT_MS` را تنظیم کنید |
+| آمار خالی | D1 وصل نیست | binding `DB` و اجرای migration |
+| کش کار نمی‌کند | KV وصل نیست | binding `CACHE` |
+| Cron اجرا نمی‌شود | trigger ثبت نشده | `[triggers]` در `wrangler.toml` یا Dashboard |
+
+### لاگ‌های امن
+- هرگز کل توکن را لاگ نکنید؛ در صورت نیاز فقط ۶ کاراکتر اول/آخر.
+- `ADMIN_TOKEN` تنها با مقایسهٔ `timingSafeEqual` بررسی می‌شود.
+- API Keyها فقط به‌صورت هش ذخیره می‌شوند و لیست ادمین هیچ هشی برنمی‌گرداند.
+
+---
+
+## ۱۰) حذف کامل
+
+```bash
+npx wrangler delete
+npx wrangler kv namespace delete --namespace-id <KV_ID>
+npx wrangler d1 delete insta-worker-db
+```
+
+> قبل از حذف D1، در صورت نیاز backup بگیرید:
+> `npx wrangler d1 export insta-worker-db --output backup.sql --remote`

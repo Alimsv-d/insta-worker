@@ -74,3 +74,97 @@ test("deriveQualityLabel never invents dimensions", () => {
   assert.equal(deriveQualityLabel({ height: 720 }, "video"), "720p");
   assert.equal(deriveQualityLabel({ quality: "HD" }, "video"), "HD");
 });
+
+test("rejects non-https, credentials and non-default ports in variant URLs", () => {
+  const payload = {
+    video: [
+      { video: "http://scontent.cdninstagram.com/v.mp4" },
+      { video: "https://user:pass@scontent.cdninstagram.com/v.mp4" },
+      { video: "https://scontent.cdninstagram.com:8443/v.mp4" },
+      { video: "https://scontent.cdninstagram.com/ok.mp4" },
+    ],
+  };
+  const r = normalizeUpstream(payload, ctx, "p");
+  assert.equal(r.items.length, 1);
+  assert.equal(r.items[0].variants.length, 1);
+  assert.match(r.items[0].variants[0].url, /\/ok\.mp4$/);
+});
+
+test("groups the qualities of one clip into a single item", () => {
+  const payload = {
+    video: [
+      {
+        video: "https://scontent.cdninstagram.com/1-hd.mp4",
+        thumbnail: "https://scontent.cdninstagram.com/t1.jpg",
+        width: 1080,
+        height: 1920,
+      },
+      {
+        video: "https://scontent.cdninstagram.com/1-sd.mp4",
+        thumbnail: "https://scontent.cdninstagram.com/t1.jpg",
+        width: 720,
+        height: 1280,
+      },
+      { video: "https://scontent.cdninstagram.com/2.mp4", thumbnail: "https://scontent.cdninstagram.com/t2.jpg" },
+    ],
+  };
+  const r = normalizeUpstream(payload, ctx, "p");
+  assert.equal(r.items.length, 2);
+  assert.equal(r.items[0].variants.length, 2);
+  assert.equal(r.items[0].variants[0].quality, "1080x1920");
+  assert.equal(r.items[1].variants.length, 1);
+});
+
+test("deduplicates across items and drops items left empty", () => {
+  const payload = {
+    items: [
+      { type: "video", video_versions: [{ url: "https://scontent.cdninstagram.com/same.mp4" }] },
+      { type: "video", video_versions: [{ url: "https://scontent.cdninstagram.com/same.mp4" }] },
+    ],
+  };
+  const r = normalizeUpstream(payload, ctx, "p");
+  assert.equal(r.items.length, 1);
+  assert.equal(r.items[0].variants.length, 1);
+});
+
+test("duration is normalised to seconds and duration_ms wins", () => {
+  const r = normalizeUpstream(
+    {
+      video: [{ video: "https://scontent.cdninstagram.com/v.mp4" }],
+      duration_ms: 12_500,
+      duration: 99,
+    },
+    ctx,
+    "p",
+  );
+  assert.equal(r.duration, 12.5);
+});
+
+test("an image variant can never end up with a video MIME/extension", () => {
+  const r = normalizeUpstream({ image: ["https://scontent.cdninstagram.com/a.jpg"] }, ctx, "p");
+  const v = r.items[0].variants[0];
+  assert.equal(v.mime, "image/jpeg");
+  assert.match(v.filename, /\.jpg$/);
+});
+
+test("caption is sanitised (control characters removed, trimmed)", () => {
+  const r = normalizeUpstream(
+    { image: ["https://scontent.cdninstagram.com/a.jpg"], caption: "  hello\u0000\tworld  " },
+    ctx,
+    "p",
+  );
+  assert.equal(r.caption, "hello world");
+});
+
+test("a video URL is never promoted to the top-level thumbnail", () => {
+  const r = normalizeUpstream(
+    {
+      video: [{ video: "https://scontent.cdninstagram.com/v.mp4" }],
+      display_url: "https://scontent.cdninstagram.com/v.mp4",
+    },
+    ctx,
+    "p",
+  );
+  assert.equal(r.thumbnail, null);
+});
+

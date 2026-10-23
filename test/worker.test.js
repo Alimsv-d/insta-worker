@@ -16,22 +16,27 @@ function kvStub() {
   };
 }
 
-function d1Stub() {
-  // Minimal D1 stub: prepare().bind().run()/first() are no-ops that succeed.
+function d1Stub(rows = {}) {
+  // Minimal D1 stub: prepare(...) and prepare(...).bind(...) both expose
+  // run()/first()/all() so ensureSchema() and the admin queries work.
   return {
-    prepare() {
-      return {
+    prepare(sql) {
+      const api = {
+        async run() {
+          return { success: true, meta: { changes: 1 } };
+        },
+        async first() {
+          if (/FROM api_keys/i.test(sql)) return rows.apiKey || null;
+          return null;
+        },
+        async all() {
+          return { results: rows.apiKeys || [] };
+        },
         bind() {
-          return {
-            async run() {
-              return { success: true };
-            },
-            async first() {
-              return null;
-            },
-          };
+          return api;
         },
       };
+      return api;
     },
   };
 }
@@ -121,7 +126,7 @@ test("thumbnail rejects disallowed host", async () => {
 
 test("rate limit returns 429 with Retry-After", async () => {
   const tightEnv = { ...env, KV: kvStub(), RATE_LIMIT_PER_MINUTE: "1" };
-  const path = "/api/v1/resolve?url=" + encodeURIComponent("https://www.instagram.com/reel/RL1/");
+  const path = "/api/v1/resolve?url=" + encodeURIComponent("https://www.instagram.com/reel/RL11/");
   const origFetch = globalThis.fetch;
   globalThis.fetch = async () =>
     new Response(JSON.stringify({ video: [{ video: "https://scontent.cdninstagram.com/v.mp4" }] }), {
@@ -189,6 +194,9 @@ test("ETag round-trip returns 304", async () => {
       ctx,
     );
     assert.equal(r2.status, 304);
+    assert.equal(r2.headers.get("cache-control"), "private, no-store");
+    assert.equal(r2.headers.get("etag"), etag);
+    assert.ok(r2.headers.get("x-ratelimit-limit"));
   } finally {
     globalThis.fetch = origFetch;
   }
@@ -197,7 +205,7 @@ test("ETag round-trip returns 304", async () => {
 test("download proxies via mocked CDN and sets Content-Disposition", async () => {
   resetProviderState();
   const e2 = { ...env, KV: kvStub() };
-  const url = "https://www.instagram.com/reel/DL1/";
+  const url = "https://www.instagram.com/reel/DL11/";
   const origFetch = globalThis.fetch;
   globalThis.fetch = async (u) => {
     const target = String(u);
@@ -223,7 +231,7 @@ test("download passes E_PRIVATE_OR_NOT_FOUND through", async () => {
   const e2 = { ...env, KV: kvStub() };
   const url = "https://www.instagram.com/reel/GONE1/";
   const origFetch = globalThis.fetch;
-  globalThis.fetch = async () => new Response("[]", { status: 200, headers: { "content-type": "application/json" } });
+  globalThis.fetch = async () => new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
   try {
     const res = await worker.fetch(new Request("https://worker.example/api/v1/download?url=" + encodeURIComponent(url)), e2, ctx);
     assert.equal(res.status, 404);
@@ -236,7 +244,7 @@ test("download passes E_PRIVATE_OR_NOT_FOUND through", async () => {
 test("download rejects unknown quality with E_BAD_QUALITY", async () => {
   resetProviderState();
   const e2 = { ...env, KV: kvStub() };
-  const url = "https://www.instagram.com/reel/Q1/";
+  const url = "https://www.instagram.com/reel/QQ11/";
   const origFetch = globalThis.fetch;
   globalThis.fetch = async () =>
     new Response(JSON.stringify({ video: [{ video: "https://scontent.cdninstagram.com/v.mp4" }] }), {
@@ -258,7 +266,7 @@ test("download rejects unknown quality with E_BAD_QUALITY", async () => {
 test("download rejects bad index with E_BAD_INDEX", async () => {
   resetProviderState();
   const e2 = { ...env, KV: kvStub() };
-  const url = "https://www.instagram.com/reel/I1/";
+  const url = "https://www.instagram.com/reel/II11/";
   const origFetch = globalThis.fetch;
   globalThis.fetch = async () =>
     new Response(JSON.stringify({ video: [{ video: "https://scontent.cdninstagram.com/v.mp4" }] }), {
@@ -332,3 +340,158 @@ test("deep health check reports provider reachability", async () => {
     globalThis.fetch = origFetch;
   }
 });
+
+test("resolve is private, no-store and carries a strong ETag", async () => {
+  resetProviderState();
+  const e2 = { ...env, KV: kvStub() };
+  const url = "https://www.instagram.com/reel/Priv1/";
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ video: [{ video: "https://scontent.cdninstagram.com/v.mp4" }] }), {
+      headers: { "content-type": "application/json" },
+    });
+  try {
+    const res = await worker.fetch(new Request("https://worker.example/api/v1/resolve?url=" + encodeURIComponent(url)), e2, ctx);
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("cache-control"), "private, no-store");
+    assert.match(res.headers.get("etag") || "", /^"sha256-[0-9a-f]{64}"$/);
+    assert.equal(res.headers.get("x-ratelimit-limit"), "1000");
+    assert.equal(res.headers.get("x-cache"), "MISS");
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("download sends the requested inline disposition when inline=1", async () => {
+  resetProviderState();
+  const e2 = { ...env, KV: kvStub() };
+  const url = "https://www.instagram.com/reel/Inline1/";
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (u) => {
+    if (String(u).includes("/api/insta")) {
+      return new Response(JSON.stringify({ video: [{ video: "https://scontent.cdninstagram.com/v.mp4" }] }), {
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response("BINARY", {
+      status: 200,
+      headers: { "content-type": "video/mp4", "content-length": "6", "accept-ranges": "bytes" },
+    });
+  };
+  try {
+    const res = await worker.fetch(
+      new Request("https://worker.example/api/v1/download?url=" + encodeURIComponent(url) + "&inline=1"),
+      e2,
+      ctx,
+    );
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("content-disposition"), "inline");
+    assert.equal(await res.text(), "BINARY");
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("HEAD download does not consume the download quota", async () => {
+  resetProviderState();
+  const e2 = { ...env, KV: kvStub(), RATE_LIMIT_DOWNLOAD_PER_MINUTE: "1" };
+  const url = "https://www.instagram.com/reel/Head1/";
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (u) => {
+    if (String(u).includes("/api/insta")) {
+      return new Response(JSON.stringify({ video: [{ video: "https://scontent.cdninstagram.com/v.mp4" }] }), {
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response(null, {
+      status: 200,
+      headers: { "content-type": "video/mp4", "content-length": "6", "accept-ranges": "bytes" },
+    });
+  };
+  try {
+    const head = await worker.fetch(
+      new Request("https://worker.example/api/v1/download?url=" + encodeURIComponent(url), { method: "HEAD" }),
+      e2,
+      ctx,
+    );
+    assert.equal(head.status, 200);
+    // The single quota slot is still available for the real GET.
+    const get = await worker.fetch(new Request("https://worker.example/api/v1/download?url=" + encodeURIComponent(url)), e2, ctx);
+    assert.equal(get.status, 200);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("thumbnail responses are never marked immutable", async () => {
+  const e2 = { ...env, KV: kvStub() };
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response("img", { status: 200, headers: { "content-type": "image/jpeg" } });
+  try {
+    const res = await worker.fetch(
+      new Request(
+        "https://worker.example/api/v1/thumbnail?url=" + encodeURIComponent("https://scontent.cdninstagram.com/t.jpg"),
+      ),
+      e2,
+      ctx,
+    );
+    assert.equal(res.status, 200);
+    const cc = res.headers.get("cache-control") || "";
+    assert.match(cc, /max-age=300/);
+    assert.ok(!/immutable/.test(cc));
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("a disabled API key is rejected with E_KEY_DISABLED", async () => {
+  const disabledEnv = {
+    ...env,
+    KV: kvStub(),
+    DB: d1Stub({ apiKey: { key_hash: "x", disabled: 1, limit_per_minute: 100 } }),
+  };
+  const res = await worker.fetch(
+    new Request("https://worker.example/api/v1/resolve?url=" + encodeURIComponent("https://www.instagram.com/reel/Key1/"), {
+      headers: { "x-api-key": "some-key-123" },
+    }),
+    disabledEnv,
+    ctx,
+  );
+  assert.equal(res.status, 409);
+  assert.equal((await res.json()).error.code, "E_KEY_DISABLED");
+});
+
+test("admin key list never exposes hashes or keys", async () => {
+  const adminEnv = {
+    ...env,
+    KV: kvStub(),
+    ADMIN_TOKEN: "s3cret-token",
+    DB: d1Stub({ apiKeys: [{ label: "ci", limit_per_minute: 50, created_at: 1, disabled: 0 }] }),
+  };
+  const res = await worker.fetch(
+    new Request("https://worker.example/api/v1/admin/keys", {
+      headers: { authorization: "Bearer s3cret-token" },
+    }),
+    adminEnv,
+    ctx,
+  );
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.deepEqual(body.data.keys, [{ label: "ci", limit_per_minute: 50, created_at: 1, disabled: false }]);
+  assert.ok(!JSON.stringify(body).includes("key_hash"));
+});
+
+test("openapi.json only accepts GET/HEAD", async () => {
+  const res = await call("/openapi.json", { method: "POST" });
+  assert.equal(res.status, 405);
+  assert.equal((await res.json()).error.code, "E_METHOD");
+});
+
+test("the HTML document is private/no-store and carries no unsafe-inline", async () => {
+  const res = await call("/?lang=en");
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get("cache-control"), "private, no-store");
+  assert.ok(!/unsafe-inline/.test(res.headers.get("content-security-policy") || ""));
+  await res.text();
+});
+

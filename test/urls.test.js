@@ -7,7 +7,7 @@ test("accepts canonical post/reel/tv URLs", () => {
     ["https://www.instagram.com/p/ABC123/", "p"],
     ["https://www.instagram.com/reel/XYZ_9/", "reel"],
     ["https://instagram.com/tv/AbC-1/", "tv"],
-    ["https://instagr.am/p/Ab1/", "p"],
+    ["https://instagr.am/p/Ab1X/", "p"],
   ]) {
     const r = parseInstagramUrl(input);
     assert.equal(r.kind, kind, input);
@@ -22,13 +22,13 @@ test("normalises /reels/ to /reel/", () => {
 });
 
 test("forgiving scheme-less input", () => {
-  const r = parseInstagramUrl("instagram.com/p/Ab1/");
-  assert.equal(r.shortcode, "Ab1");
+  const r = parseInstagramUrl("instagram.com/p/Ab1X/");
+  assert.equal(r.shortcode, "Ab1X");
 });
 
 test("strips tracking params from canonical", () => {
-  const r = parseInstagramUrl("https://www.instagram.com/p/Ab1/?igsh=xyz&utm_source=q");
-  assert.equal(r.canonical, "https://www.instagram.com/p/Ab1/");
+  const r = parseInstagramUrl("https://www.instagram.com/p/Ab1X/?igsh=xyz&utm_source=q");
+  assert.equal(r.canonical, "https://www.instagram.com/p/Ab1X/");
 });
 
 test("rejects non-instagram hosts", () => {
@@ -42,9 +42,9 @@ test("rejects non-instagram hosts", () => {
 });
 
 test("rejects http, ports and credentials", () => {
-  assert.throws(() => parseInstagramUrl("http://www.instagram.com/p/Ab1/"));
+  assert.throws(() => parseInstagramUrl("http://www.instagram.com/p/Ab1X/"));
   assert.throws(() => parseInstagramUrl("https://www.instagram.com:8443/p/Ab1/"));
-  assert.throws(() => parseInstagramUrl("https://user:pass@www.instagram.com/p/Ab1/"));
+  assert.throws(() => parseInstagramUrl("https://user:pass@www.instagram.com/p/Ab1X/"));
 });
 
 test("rejects wrong paths and bad shortcodes", () => {
