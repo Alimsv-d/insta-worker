@@ -5,61 +5,50 @@ compatibility_date = "2024-11-06"
 workers_dev = true
 
 # ---------------------------------------------------------------------------
-# KV namespace (rate-limit + short-lived metadata cache).
+# KV namespace: rate limiting + short-lived metadata cache.
 #
-# No `id` -> auto-provisioned by `wrangler deploy` (Wrangler >= 3.60). If you
-# use an older Wrangler, create the namespace in the dashboard and set
+# No `id` -> auto-provisioned by `wrangler deploy` (Wrangler >= 3.60). The
+# worker still runs if KV is missing: the cache and the rate limiter degrade
+# gracefully. To bind an existing namespace, add:
 #   id = "<namespace-id>"
-# Removing the fake `preview_id` is intentional: it made `wrangler dev` point at
-# a namespace that does not exist.
 # ---------------------------------------------------------------------------
 [[kv_namespaces]]
 binding = "KV"
 
 # ---------------------------------------------------------------------------
-# D1 database (anonymous stats + optional API keys).
-#
-# No `database_id` -> auto-provisioned. The schema is applied idempotently on
-# first request and is mirrored in migrations/0001_init.sql:
-#   npx wrangler d1 migrations apply insta_worker --remote
+# Non-sensitive configuration. Every value has a safe default, so the Deploy
+# button works without filling any field.
 # ---------------------------------------------------------------------------
-[[d1_databases]]
-binding = "DB"
-database_name = "insta_worker"
-migrations_dir = "migrations"
-
 [vars]
 # Ordered, comma-separated list of upstream providers. First healthy wins.
 UPSTREAM_URLS = "https://catplus.ir/api/insta"
-# Rate limits (requests per minute per IP / API key).
+# Rate limits (requests per minute per IP or API key).
 RATE_LIMIT_PER_MINUTE = "60"
 RATE_LIMIT_DOWNLOAD_PER_MINUTE = "20"
 RATE_LIMIT_THUMBNAIL_PER_MINUTE = "60"
-RATE_LIMIT_ADMIN_PER_MINUTE = "10"
 RATE_LIMIT_HEALTH_PER_MINUTE = "10"
 # Hard cap for a proxied download, in megabytes.
 MAX_DOWNLOAD_MB = "80"
-# Comma-separated allowlist of CDN host suffixes the proxy may fetch from.
-# Supports a leading "*." wildcard for subdomains.
-CDN_ALLOWLIST = "*.cdninstagram.com,*.fbcdn.net,*.instagram.com,*.facebook.com"
-# Contact / takedown link shown in the UI and referenced by /health.
-CONTACT_URL = "https://github.com/Alimsv-d/insta-worker/issues"
-# Short cache TTL for resolved metadata, in seconds (signed links expire).
+# Comma-separated CDN host suffixes the proxy may fetch from.
+CDN_ALLOWLIST = "*.cdninstagram.com,*.fbcdn.net"
+# CORS: "*" (default) or a comma-separated list of allowed origins.
+ALLOWED_ORIGINS = "*"
+# Short cache TTL for resolved metadata, in seconds (clamped to 60..900).
 CACHE_TTL_SECONDS = "120"
-# Per-provider upstream timeout in milliseconds.
+# Per-provider upstream timeout in milliseconds (headers and body).
 UPSTREAM_TIMEOUT_MS = "12000"
-# Default UI / API language: fa | en.
-DEFAULT_LANG = "fa"
-
-# Secrets (set with `wrangler secret put <NAME>`). Never commit values.
-# ADMIN_TOKEN                 -> protects /api/v1/admin/*
-# UPSTREAM_TOKEN              -> optional bearer token sent to upstream providers
-# IP_HASH_SECRET              -> >= 16 chars; keys the HMAC used for IP hashes
-#                                (a constant default is used when unset, which
-#                                 makes hashes comparable across deployments)
 
 # ---------------------------------------------------------------------------
-# Cron trigger: delete anonymous stats older than the retention window.
+# Optional secrets. None of them is required, and none is configured here.
+# Add them only through the Dashboard (Settings -> Variables and Secrets) or
+# `wrangler secret put <NAME>`:
+#
+#   API_KEYS            comma-separated keys. When set, every /api/v1 request
+#                       must send `Authorization: Bearer <key>` or
+#                       `x-api-key: <key>`.
+#   UPSTREAM_TOKEN      bearer token forwarded only to the matching upstream
+#                       (UPSTREAM_TOKEN_HOST, or the only configured provider).
+#   UPSTREAM_TOKEN_HOST optional host that owns UPSTREAM_TOKEN.
+#   IP_HASH_SECRET      optional random string (>= 16 chars) used to key the
+#                       HMAC bucket for IP-based rate limiting.
 # ---------------------------------------------------------------------------
-[triggers]
-crons = ["0 3 * * *"]

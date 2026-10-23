@@ -1,5 +1,5 @@
-// Cryptographic helpers that are used by the router (constant-time compare
-// for admin tokens and API key hashes).
+// Cryptographic helpers used by the router (constant-time comparison of API
+// keys).
 
 /**
  * Constant-time string comparison.

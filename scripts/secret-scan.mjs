@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 // Scans the working tree (tracked-ish files) for accidental secrets before a
-// push. Exits non-zero if anything suspicious is found. Personal identifiers
-// (a specific Telegram admin id, channel handles, bot tokens) and Cloudflare /
-// provider tokens are all flagged.
+// push. Exits non-zero if anything suspicious is found. Cloudflare, upstream
+// and generic bearer/credential assignments are flagged.
 
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
@@ -13,9 +12,6 @@ const SKIP_FILES = new Set(["scripts/secret-scan.mjs"]);
 const TEXT_EXT = /\.(js|mjs|cjs|ts|json|toml|md|txt|yml|yaml|html|css|example|sh)$/i;
 
 const PATTERNS = [
-  { name: "Telegram bot token", re: /\b\d{7,12}:AA[A-Za-z0-9_-]{30,}\b/ },
-  { name: "Telegram admin id (personal)", re: /\b7354122540\b/ },
-  { name: "Telegram channel handle", re: /@RMSource\b|RMSourceBot|t\.me\/RMSource/i },
   { name: "Cloudflare API token", re: /\b[A-Za-z0-9_-]{40}\b(?=.*cloudflare)|CLOUDFLARE_API_TOKEN\s*[:=]\s*["']?[A-Za-z0-9_-]{20,}/i },
   { name: "AWS access key", re: /\bAKIA[0-9A-Z]{16}\b/ },
   { name: "Private key block", re: /-----BEGIN (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----/ },

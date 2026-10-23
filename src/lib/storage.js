@@ -1,29 +1,28 @@
-// Storage: KV (rate-limit + short-lived cache) and D1 (anonymous stats,
-// optional API keys).
+// KV storage: rate limiting and a short-lived metadata cache.
 //
-// Privacy / robustness rules enforced here:
-//   * the raw IP is NEVER stored or logged. It is hashed with HMAC-SHA256
-//     using IP_HASH_SECRET (a safe built-in default is used when the secret
-//     is not configured);
-//   * the cache TTL has a hard minimum of 60 seconds (signed media URLs
-//     expire, a shorter TTL would only waste upstream quota);
-//   * the KV rate limiter is a fixed window and is APPROXIMATE: get + put is
-//     not atomic, so a burst can exceed the limit by a few requests;
-//   * statistics are written through ctx.waitUntil and can never break a
-//     response; failures are counted and logged instead of being swallowed;
-//   * the D1 schema is applied idempotently with a backoff, and the very
-//     same statements live in migrations/0001_init.sql.
-
-import { newRequestId } from "./http.js";
+// This service intentionally has **no D1 database**. KV is optional too: when
+// the binding is missing every helper degrades gracefully (requests still work,
+// only the cache and the rate limiter are skipped).
+//
+// Privacy / robustness rules:
+//   * the raw IP is NEVER stored. Only an HMAC-SHA256 bucket key is written to
+//     KV. IP_HASH_SECRET is optional; a built-in public default is used when it
+//     is not configured;
+//   * an unknown IP never shares a bucket with other clients;
+//   * the cache TTL has a hard minimum of 60 seconds (signed media URLs expire;
+//     a shorter TTL only wastes upstream quota);
+//   * the rate limiter is a fixed window and is APPROXIMATE: KV `get` + `put`
+//     are not atomic, so a burst can exceed the limit by a few requests. It
+//     stops casual abuse; it is NOT a hard quota.
 
 // ---------------------------------------------------------------------------
-// Hashing (never store raw IPs)
+// Hashing (never store raw IPs or raw API keys)
 // ---------------------------------------------------------------------------
 
 /**
- * Fallback secret used when IP_HASH_SECRET is not configured. It is a
- * constant, therefore IP hashes are comparable across instances — set a
- * private secret in production to avoid that.
+ * Fallback secret used when IP_HASH_SECRET is not configured. It is public, so
+ * set a private secret in production if you do not want IP hashes to be
+ * comparable across deployments. It is not a credential.
  */
 export const DEFAULT_IP_HASH_SECRET = "insta-worker-default-ip-hash-secret";
 
@@ -51,13 +50,12 @@ export async function hmacHex(secret, message) {
 }
 
 /**
- * The per-client bucket key.
+ * The per-client rate-limit bucket key.
  *
- * The IP is hashed with HMAC (keyed, so the hash cannot be brute forced from
- * a leaked table). When no IP header is available we do NOT fall back to a
- * shared "0.0.0.0" bucket — that would put every anonymous client into the
- * same rate-limit bucket. Instead we derive a coarse bucket from the client
- * headers that are available.
+ * The IP is HMAC-hashed (keyed, so a leaked KV entry cannot be brute-forced).
+ * When no IP header is available we derive a coarse key from the client
+ * headers; if even those are absent we generate a random key, so anonymous
+ * clients are never placed in one shared bucket.
  */
 export async function clientKey(request, env) {
   const secret = ipHashSecret(env);
@@ -67,30 +65,36 @@ export async function clientKey(request, env) {
     request.headers.get("x-real-ip") ||
     "";
   if (ip) return "ip:" + (await hmacHex(secret, "ip:" + ip));
+
   const coarse = [
     request.headers.get("user-agent") || "",
     request.headers.get("accept-language") || "",
     request.headers.get("cf-ray") || "",
   ].join("|");
-  return "anon:" + (await hmacHex(secret, "coarse:" + coarse));
+  if (coarse.replace(/\|/g, "")) {
+    return "anon:" + (await hmacHex(secret, "coarse:" + coarse));
+  }
+  // No identifying input at all: never share a bucket with other clients.
+  let random;
+  try {
+    random = crypto.randomUUID();
+  } catch {
+    random = Math.random().toString(36).slice(2) + Date.now().toString(36);
+  }
+  return "anon:" + (await hmacHex(secret, "random:" + random));
 }
 
-/** Hash of an API key. Only the hash is ever stored. */
-export async function apiKeyHash(env, key) {
-  const secret = ipHashSecret(env);
-  return hmacHex(secret, "apikey:" + key);
+/** A stable bucket key for an authenticated API key (raw key is not stored). */
+export async function apiKeyBucket(env, key) {
+  return "key:" + (await hmacHex(ipHashSecret(env), "apikey:" + key));
 }
 
 // ---------------------------------------------------------------------------
 // Rate limiting (fixed window per minute — APPROXIMATE)
 // ---------------------------------------------------------------------------
 
-/** Error counters, exposed for /health and for the tests. */
 export const COUNTERS = {
   kvErrors: 0,
-  d1Errors: 0,
-  schemaErrors: 0,
-  statErrors: 0,
 };
 
 function numEnv(env, name, fallback) {
@@ -100,15 +104,12 @@ function numEnv(env, name, fallback) {
   return Math.floor(n);
 }
 
-/**
- * The configured limits per bucket. Invalid values fall back to the default.
- */
+/** Configured limits per bucket. Invalid values fall back to the defaults. */
 export function rateLimits(env) {
   return {
     resolve: numEnv(env, "RATE_LIMIT_PER_MINUTE", 60),
     download: numEnv(env, "RATE_LIMIT_DOWNLOAD_PER_MINUTE", 20),
     thumbnail: numEnv(env, "RATE_LIMIT_THUMBNAIL_PER_MINUTE", 60),
-    admin: numEnv(env, "RATE_LIMIT_ADMIN_PER_MINUTE", 10),
     health: numEnv(env, "RATE_LIMIT_HEALTH_PER_MINUTE", 10),
   };
 }
@@ -116,10 +117,8 @@ export function rateLimits(env) {
 /**
  * Fixed-window rate limiter.
  *
- * NOTE: this is approximate. The read (get) and the write (put) are two
- * separate KV operations and are not atomic, so a burst of parallel requests
- * can exceed the limit by a small number. It is good enough to stop casual
- * abuse, it is NOT a hard quota.
+ * NOTE: this is approximate (see the file header). Concurrent requests can
+ * exceed the configured limit by a small amount.
  *
  * @returns {{allowed:boolean, limit:number, remaining:number, reset:number, retryAfter:number}}
  */
@@ -161,12 +160,13 @@ export function rateHeaders(rl) {
 }
 
 // ---------------------------------------------------------------------------
-// Short-lived metadata cache (signed URLs expire -> very short TTL)
+// Short-lived metadata cache (signed URLs expire -> short TTL)
 // ---------------------------------------------------------------------------
 
 export const MIN_CACHE_TTL = 60;
 export const MAX_CACHE_TTL = 900;
 
+/** Cache TTL in seconds, clamped to [60, 900]; invalid values use 120. */
 export function cacheTtl(env) {
   const raw = env ? env.CACHE_TTL_SECONDS : undefined;
   const n = Number(raw);
@@ -197,8 +197,8 @@ export async function cacheSet(env, shortcode, value) {
 }
 
 /**
- * A STRONG ETag: the SHA-256 of the serialised payload. Strong validators
- * may be used for range requests and are never confused with a weak one.
+ * A STRONG ETag: SHA-256 of the serialised payload. Strong validators may be
+ * used for range requests and never carry the weak `W/` prefix.
  */
 export async function etagFrom(value) {
   const str = JSON.stringify(value);
@@ -206,249 +206,3 @@ export async function etagFrom(value) {
   const hex = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
   return `"sha256-${hex}"`;
 }
-
-// ---------------------------------------------------------------------------
-// D1: schema + anonymous stats (idempotent, auto-migrate once per isolate)
-// ---------------------------------------------------------------------------
-
-/**
- * The schema statements. They are kept in sync with
- * migrations/0001_init.sql (a test asserts that).
- */
-export const SCHEMA = [
-  `CREATE TABLE IF NOT EXISTS stats (
-     id INTEGER PRIMARY KEY AUTOINCREMENT,
-     ts INTEGER NOT NULL,
-     event TEXT NOT NULL,
-     code TEXT,
-     ip_hash TEXT,
-     shortcode TEXT,
-     provider TEXT
-   )`,
-  `CREATE INDEX IF NOT EXISTS idx_stats_ts ON stats(ts)`,
-  `CREATE INDEX IF NOT EXISTS idx_stats_event ON stats(event)`,
-  `CREATE TABLE IF NOT EXISTS api_keys (
-     key_hash TEXT PRIMARY KEY,
-     label TEXT,
-     limit_per_minute INTEGER,
-     created_at INTEGER,
-     disabled INTEGER DEFAULT 0
-   )`,
-];
-
-const SCHEMA_STATE = { ready: false, attempts: 0, nextAttemptAt: 0 };
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-/**
- * Apply the schema idempotently. Failures are retried with a backoff and
- * then reported; the service keeps working without statistics.
- */
-export async function ensureSchema(env) {
-  if (!env || !env.DB) return false;
-  if (SCHEMA_STATE.ready) return true;
-  const now = Date.now();
-  if (SCHEMA_STATE.nextAttemptAt && now < SCHEMA_STATE.nextAttemptAt) return false;
-
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      for (const stmt of SCHEMA) {
-        await env.DB.prepare(stmt).run();
-      }
-      SCHEMA_STATE.ready = true;
-      SCHEMA_STATE.attempts = 0;
-      SCHEMA_STATE.nextAttemptAt = 0;
-      return true;
-    } catch (err) {
-      SCHEMA_STATE.attempts++;
-      COUNTERS.schemaErrors++;
-      console.error(`[storage] ensureSchema failed (attempt ${attempt + 1}/${3}):`, err && err.message);
-      if (attempt < 2) await sleep(100 * Math.pow(2, attempt));
-    }
-  }
-  // Do not hammer D1 on every request.
-  SCHEMA_STATE.nextAttemptAt = Date.now() + 30_000;
-  return false;
-}
-
-/**
- * Write one anonymous statistic. Never throws: a failing statistic must not
- * break the response. When a Workers context is available the write is
- * handed to ctx.waitUntil so it does not delay the answer.
- */
-export function recordStat(env, payload, ctx) {
-  const { event, code, ipHash, shortcode, provider } = payload || {};
-  if (!env || !env.DB || !event) return Promise.resolve();
-  const run = async () => {
-    try {
-      await ensureSchema(env);
-      await env.DB.prepare(
-        "INSERT INTO stats (ts, event, code, ip_hash, shortcode, provider) VALUES (?, ?, ?, ?, ?, ?)",
-      )
-        .bind(Date.now(), event, code || null, ipHash || null, shortcode || null, provider || null)
-        .run();
-    } catch (err) {
-      COUNTERS.statErrors++;
-      console.error(`[storage] recordStat(${event}) failed:`, err && err.message);
-    }
-  };
-  if (ctx && typeof ctx.waitUntil === "function") {
-    try {
-      ctx.waitUntil(run());
-      return Promise.resolve();
-    } catch (err) {
-      COUNTERS.statErrors++;
-      console.error("[storage] waitUntil failed:", err && err.message);
-    }
-  }
-  return run();
-}
-
-/**
- * Delete statistics older than `cutoffTs`. Used by the scheduled Cron
- * trigger so the D1 table cannot grow forever.
- */
-export async function purgeOldStats(env, cutoffTs) {
-  if (!env || !env.DB) return { deleted: 0 };
-  try {
-    await ensureSchema(env);
-    const cutoff = Number.isFinite(Number(cutoffTs)) ? Number(cutoffTs) : Date.now() - 30 * 24 * 3600 * 1000;
-    const res = await env.DB.prepare("DELETE FROM stats WHERE ts < ?").bind(cutoff).run();
-    const deleted = res && typeof res.meta === "object" && res.meta && Number.isFinite(res.meta.changes)
-      ? res.meta.changes
-      : 0;
-    return { deleted };
-  } catch (err) {
-    COUNTERS.d1Errors++;
-    console.error("[storage] purgeOldStats failed:", err && err.message);
-    return { deleted: 0, error: String((err && err.message) || err) };
-  }
-}
-
-// ---------------------------------------------------------------------------
-// API keys (optional, D1-backed) — only the hash is stored
-// ---------------------------------------------------------------------------
-
-export const MAX_KEY_LIMIT_PER_MINUTE = 10_000;
-
-export async function lookupApiKey(env, key) {
-  if (!env || !env.DB || !key) return null;
-  try {
-    await ensureSchema(env);
-    const hash = await apiKeyHash(env, key);
-    const row = await env.DB.prepare(
-      "SELECT key_hash, label, limit_per_minute, disabled FROM api_keys WHERE key_hash = ?",
-    )
-      .bind(hash)
-      .first();
-    if (!row) return null;
-    return {
-      found: true,
-      disabled: !!row.disabled,
-      label: row.label || null,
-      limitPerMinute: Number.isFinite(Number(row.limit_per_minute)) && Number(row.limit_per_minute) > 0
-        ? Math.floor(Number(row.limit_per_minute))
-        : null,
-    };
-  } catch (err) {
-    COUNTERS.d1Errors++;
-    console.error("[storage] lookupApiKey failed:", err && err.message);
-    return null;
-  }
-}
-
-/**
- * Validate a per-key limit. Returns {ok, value} — the limit must be an
- * integer between 1 and MAX_KEY_LIMIT_PER_MINUTE.
- */
-export function validateLimitPerMinute(value) {
-  if (value === undefined || value === null || value === "") return { ok: true, value: null };
-  const n = Number(value);
-  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 1 || n > MAX_KEY_LIMIT_PER_MINUTE) {
-    return { ok: false, value: null };
-  }
-  return { ok: true, value: n };
-}
-
-/**
- * Create (or update the label / limit of) an API key.
- *
- * A disabled key can never be re-enabled: the attempt is rejected with
- * E_KEY_DISABLED. Only the HMAC hash of the key is stored.
- */
-export async function createApiKey(env, { key, label, limitPerMinute }) {
-  if (!env || !env.DB) {
-    const err = new Error("no_database");
-    err.code = "E_INTERNAL";
-    throw err;
-  }
-  const hash = await apiKeyHash(env, key);
-  await ensureSchema(env);
-
-  const existing = await env.DB.prepare("SELECT key_hash, disabled FROM api_keys WHERE key_hash = ?")
-    .bind(hash)
-    .first();
-  if (existing && existing.disabled) {
-    const err = new Error("key_disabled");
-    err.code = "E_KEY_DISABLED";
-    throw err;
-  }
-
-  await env.DB.prepare(
-    "INSERT INTO api_keys (key_hash, label, limit_per_minute, created_at, disabled) VALUES (?, ?, ?, ?, 0) ON CONFLICT(key_hash) DO UPDATE SET label=excluded.label, limit_per_minute=excluded.limit_per_minute",
-  )
-    .bind(hash, label || null, limitPerMinute || null, Date.now())
-    .run();
-  return { hash };
-}
-
-/**
- * Disable an API key. Disabled keys stay disabled forever.
- */
-export async function disableApiKey(env, key) {
-  if (!env || !env.DB) {
-    const err = new Error("no_database");
-    err.code = "E_INTERNAL";
-    throw err;
-  }
-  const hash = await apiKeyHash(env, key);
-  await ensureSchema(env);
-  await env.DB.prepare("UPDATE api_keys SET disabled = 1 WHERE key_hash = ?").bind(hash).run();
-  return { hash };
-}
-
-/**
- * List the API keys. Only labels, limits and state are returned — never a
- * hash and never a key.
- */
-export async function listApiKeys(env) {
-  if (!env || !env.DB) return [];
-  try {
-    await ensureSchema(env);
-    const res = await env.DB.prepare(
-      "SELECT label, limit_per_minute, created_at, disabled FROM api_keys ORDER BY created_at DESC LIMIT 200",
-    ).all();
-    const rows = (res && res.results) || [];
-    return rows.map((r) => ({
-      label: r.label || null,
-      limit_per_minute: Number.isFinite(Number(r.limit_per_minute)) ? Number(r.limit_per_minute) : null,
-      created_at: r.created_at || null,
-      disabled: !!r.disabled,
-    }));
-  } catch (err) {
-    COUNTERS.d1Errors++;
-    console.error("[storage] listApiKeys failed:", err && err.message);
-    return [];
-  }
-}
-
-export function bearerToken(request) {
-  const h = request.headers.get("authorization") || "";
-  const m = h.match(/^Bearer\s+(.+)$/i);
-  return m ? m[1].trim() : null;
-}
-
-export function apiKey(request) {
-  return request.headers.get("x-api-key") || bearerToken(request);
-}
-
-export { newRequestId };

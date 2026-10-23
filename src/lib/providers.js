@@ -38,8 +38,7 @@ export function parseUpstreams(env) {
     .filter(Boolean);
   const usable = list.filter((s) => {
     try {
-      const u = new URL(s);
-      return u.protocol === "https:" || u.protocol === "http:";
+      return new URL(s).protocol === "https:";
     } catch {
       return false;
     }
@@ -163,6 +162,16 @@ function upstreamError(code, message) {
   return err;
 }
 
+/** A timeout is a distinct failure class, never "content not found". */
+function isTimeout(err) {
+  return Boolean(
+    err &&
+      (err.code === "E_UPSTREAM_TIMEOUT" ||
+        err.name === "TimeoutError" ||
+        err.name === "AbortError"),
+  );
+}
+
 /**
  * Fetch with manual redirect handling: redirects are never followed
  * automatically and only same-origin hops are allowed (max 2).
@@ -232,8 +241,11 @@ export async function callProvider(base, target, { fetchImpl, timeoutMs, token, 
       }
       return json;
     } catch (err) {
-      lastErr = err;
-      if (err && err.code === "E_PRIVATE_OR_NOT_FOUND") break; // no point retrying
+      const timeout = isTimeout(err);
+      lastErr = timeout
+        ? upstreamError("E_UPSTREAM_TIMEOUT", (err && err.message) || "upstream_timeout")
+        : err;
+      if (lastErr && lastErr.code === "E_PRIVATE_OR_NOT_FOUND") break; // no point retrying
       if (i < attempts - 1) {
         // Exponential backoff with jitter.
         const backoff = 200 * Math.pow(2, i) * (0.5 + Math.random());
@@ -241,12 +253,8 @@ export async function callProvider(base, target, { fetchImpl, timeoutMs, token, 
       }
     }
   }
-  const wrapped = upstreamError(
-    lastErr && lastErr.code ? lastErr.code : "E_UPSTREAM_FAILED",
-    (lastErr && lastErr.message) || "upstream_failed",
-  );
-  if (lastErr && lastErr.code === "E_PRIVATE_OR_NOT_FOUND") throw wrapped;
-  throw wrapped;
+  const finalCode = lastErr && lastErr.code ? lastErr.code : "E_UPSTREAM_FAILED";
+  throw upstreamError(finalCode, (lastErr && lastErr.message) || "upstream_failed");
 }
 
 /**
@@ -257,16 +265,22 @@ export async function callProvider(base, target, { fetchImpl, timeoutMs, token, 
 export async function resolveContent(ctx, env, options = {}) {
   const fetchImpl = options.fetchImpl || fetch;
   const providers = options.providers || parseUpstreams(env);
-  const timeoutMs = options.timeoutMs || numericEnv(env, "UPSTREAM_TIMEOUT_MS", DEFAULT_TIMEOUT_MS);
+  const rawTimeout = options.timeoutMs !== undefined ? options.timeoutMs : env && env.UPSTREAM_TIMEOUT_MS;
+  const timeoutMs = numericEnv({ UPSTREAM_TIMEOUT_MS: rawTimeout }, "UPSTREAM_TIMEOUT_MS", DEFAULT_TIMEOUT_MS);
   const attempts = options.attempts || DEFAULT_ATTEMPTS;
 
   let sawNotFound = false;
+  let sawTimeout = false;
   let sawAnyFailure = false;
+  let skipped = 0;
 
   for (const base of providers) {
     const key = breakerKey(base);
     const name = providerName(base);
-    if (!allowProvider(key)) continue;
+    if (!allowProvider(key)) {
+      skipped++;
+      continue;
+    }
     const token = tokenForProvider(base, env, providers.length);
     try {
       const payload = await callProvider(base, ctx.canonical, { fetchImpl, timeoutMs, token, attempts });
@@ -285,15 +299,17 @@ export async function resolveContent(ctx, env, options = {}) {
         continue;
       }
       // A network/timeout failure is NOT "not found".
-      sawAnyFailure = true;
+      if (isTimeout(err)) sawTimeout = true;
+      else sawAnyFailure = true;
       recordFailure(key);
     }
   }
 
-  if (sawNotFound && !sawAnyFailure) {
-    throw upstreamError("E_PRIVATE_OR_NOT_FOUND", "private_or_not_found");
-  }
-  throw upstreamError("E_UPSTREAM_FAILED", "upstream_failed");
+  if (sawAnyFailure) throw upstreamError("E_UPSTREAM_FAILED", "upstream_failed");
+  if (sawTimeout) throw upstreamError("E_UPSTREAM_TIMEOUT", "upstream_timeout");
+  if (sawNotFound) throw upstreamError("E_PRIVATE_OR_NOT_FOUND", "private_or_not_found");
+  if (skipped > 0) throw upstreamError("E_UPSTREAM_UNAVAILABLE", "breaker_open");
+  throw upstreamError("E_UPSTREAM_UNAVAILABLE", "no_provider");
 }
 
 /**
@@ -303,7 +319,9 @@ export async function resolveContent(ctx, env, options = {}) {
 export async function checkProviderHealth(env, options = {}) {
   const fetchImpl = options.fetchImpl || fetch;
   const providers = options.providers || parseUpstreams(env);
-  const timeoutMs = Math.min(5000, options.timeoutMs || numericEnv(env, "UPSTREAM_TIMEOUT_MS", DEFAULT_TIMEOUT_MS));
+  const baseTimeout = numericEnv(env, "UPSTREAM_TIMEOUT_MS", DEFAULT_TIMEOUT_MS);
+  const rawTimeout = options.timeoutMs !== undefined ? options.timeoutMs : baseTimeout;
+  const timeoutMs = Math.min(5000, numericEnv({ UPSTREAM_TIMEOUT_MS: rawTimeout }, "UPSTREAM_TIMEOUT_MS", baseTimeout));
   const results = [];
   for (const base of providers) {
     const name = providerName(base);
@@ -316,9 +334,23 @@ export async function checkProviderHealth(env, options = {}) {
         { method: "GET", signal },
         fetchImpl,
       );
+      // A health probe never consumes the body.
+      if (res.body) {
+        try {
+          await res.body.cancel();
+        } catch {
+          /* ignore */
+        }
+      }
       results.push({ provider: name, reachable: true, status: res.status, latency_ms: Date.now() - started });
     } catch (e) {
-      results.push({ provider: name, reachable: false, error: String((e && e.message) || e), latency_ms: Date.now() - started });
+      const timeout = isTimeout(e);
+      results.push({
+        provider: name,
+        reachable: false,
+        error: timeout ? "timeout" : String((e && e.message) || e),
+        latency_ms: Date.now() - started,
+      });
     }
   }
   return results;

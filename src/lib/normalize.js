@@ -18,7 +18,7 @@
 //   * `has_audio` is null when the upstream does not say (never a guess);
 //   * caption / username / avatar / quality are sanitised.
 
-import { buildFilename } from "./urls.js";
+import { buildFilename, stripTrackingParams } from "./urls.js";
 
 const VIDEO_EXT_RE = /\.(mp4|mov|webm|m4v)(\?|$)/i;
 const IMAGE_EXT_RE = /\.(jpe?g|png|webp|heic|avif|gif)(\?|$)/i;
@@ -124,7 +124,7 @@ export function sanitizeUrl(value) {
   if (url.protocol !== "https:") return null;
   if (url.username || url.password) return null;
   if (url.port && url.port !== "443") return null;
-  return url.toString();
+  return stripTrackingParams(url).toString();
 }
 
 function extFromUrl(url) {
@@ -284,16 +284,6 @@ function thumbnailOf(v) {
   return sanitizeUrl(raw);
 }
 
-function detectType(payload, kind) {
-  if (payload && typeof payload.type === "string") {
-    const t = payload.type.toLowerCase();
-    if (["video", "reel", "igtv"].includes(t)) return "video";
-    if (["image", "photo", "picture"].includes(t)) return "image";
-    if (["album", "carousel", "sidecar", "gallery"].includes(t)) return "album";
-  }
-  return kind === "reel" || kind === "tv" ? "video" : undefined;
-}
-
 /**
  * Group flat upstream entries into media objects.
  * Entries that share a thumbnail, or that carry explicit quality hints, are
@@ -388,14 +378,10 @@ export function normalizeUpstream(payload, ctx, provider = "upstream") {
   const usable = items.filter((i) => i.variants.length > 0);
   if (usable.length === 0) return null;
 
-  // The type comes from the media we actually got. An explicit upstream type
-  // wins, but a single item is always typed by its own kind (a reel URL that
-  // resolves to a photo is an image, not a video).
-  const declared = detectType(data, undefined);
-  let type;
-  if (usable.length > 1) type = "album";
-  else if (declared) type = declared;
-  else type = usable[0].type;
+  // The type must describe the media we actually got: a single item is always
+  // typed by its own kind (a reel URL that resolves to a photo is an image,
+  // not a video). Only multiple items make an album.
+  const type = usable.length > 1 ? "album" : usable[0].type;
 
   const author = normalizeAuthor(data);
   const caption = sanitizeText(

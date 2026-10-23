@@ -1,7 +1,8 @@
 # راهنمای استقرار دستی — insta-worker
 
-این راهنما برای وقتی است که نمی‌خواهید از دکمهٔ Deploy استفاده کنید. هر بخش
-مستقل است؛ فقط یکی از روش‌ها را انتخاب کنید.
+این راهنما برای وقتی است که نمی‌خواهید از دکمهٔ Deploy استفاده کنید. سرویس
+فقط-API است: هیچ رابط وب، D1، Cron یا Secret اجباری ندارد. هر بخش مستقل است؛
+فقط یکی از روش‌ها را انتخاب کنید.
 
 > پیش‌نیاز مشترک: یک حساب Cloudflare (پلن رایگان کافی است) و یک دامنهٔ متصل به
 > همان حساب اگر می‌خواهید روی دامنهٔ خودتان سرو شود. `workers.dev` هم بدون دامنه
@@ -12,7 +13,7 @@
 ## ۰) پیش‌نیازهای محلی
 
 - Node.js **۲۰ یا بالاتر**
-- Wrangler **۳.۶۰ یا بالاتر** (برای auto-provisioning خودکار KV/D1)
+- Wrangler **۳.۶۰ یا بالاتر** (برای auto-provisioning خودکار KV)
 
 ```bash
 node -v
@@ -24,7 +25,7 @@ npx wrangler login
 بررسی سریع پروژه پیش از استقرار:
 
 ```bash
-npm run check        # سینتکس + ۱۱۱ تست mock
+npm run check        # سینتکس + ۹۷ تست mock
 npm run secret-scan  # اطمینان از نبود توکن در فایل‌ها
 npm run bundle       # ساخت dist/worker.js تک‌فایلی
 ```
@@ -36,12 +37,14 @@ npm run bundle       # ساخت dist/worker.js تک‌فایلی
 1. روی دکمهٔ Deploy در `README.md` بزنید.
 2. به Cloudflare وارد شوید و اجازهٔ دسترسی به حساب را بدهید.
 3. نام Worker را تأیید کنید (مثلاً `insta-worker`).
-4. Deploy را بزنید. KV و D1 به‌صورت خودکار ساخته و bind می‌شوند.
-5. آدرس `https://<name>.<subdomain>.workers.dev` را باز کنید.
-6. Secretها را اضافه کنید (بخش ۵) و دوباره Deploy کنید.
+4. Deploy را بزنید. هیچ فیلدی اجباری نیست و D1/دیتابیسی ساخته نمی‌شود.
+5. آدرس `https://<name>.<subdomain>.workers.dev` را باز کنید؛ پاسخ باید JSON
+   باشد، نه HTML.
+6. (اختیاری) در **Settings → Variables and Secrets** متغیرها یا Secretها را
+   اضافه کنید (بخش ۲.۴ و ۲.۵).
 
-> اگر نسخهٔ Wrangler کمتر از ۳.۶۰ باشد، auto-provisioning انجام نمی‌شود و باید
-> KV/D1 را دستی بسازید (بخش ۲).
+> با Wrangler >= ۳.۶۰ فضای KV خودکار ساخته و به binding `KV` وصل می‌شود. با
+> نسخهٔ قدیمی‌تر، KV را دستی بسازید (بخش ۲.۲).
 
 ---
 
@@ -55,28 +58,25 @@ npm run bundle       # ساخت dist/worker.js تک‌فایلی
 4. **Deploy** کنید.
 
 > فایل `dist/worker.js` تک‌فایلی و ESM است و همهٔ ماژول‌ها را درون خود دارد.
+> هیچ فایل HTML/Asset وجود ندارد؛ `/` هم JSON برمی‌گرداند.
 
 ### ۲.۲ ساخت KV (محدودیت نرخ + کش)
 1. **Workers & Pages** → **KV** → **Create namespace**.
-2. نام: `insta-worker-cache`.
-3. به Worker برگردید → **Settings** → **Bindings** → **Add** → **KV namespace**:
-   - Variable name: `CACHE`
+2. نام: `insta-worker-cache` (نام دلخواه است).
+3. به Worker برگردید → **Settings** → **Bindings** → **Add** →
+   **KV namespace**:
+   - Variable name: `KV`
    - KV namespace: همان namespace ساخته‌شده
 
-### ۲.۳ ساخت D1 (آمار و API Key)
-1. **Workers & Pages** → **D1** → **Create database**.
-2. نام: `insta-worker-db`.
-3. در صفحهٔ دیتابیس، تب **Console** را باز کنید و محتوای
-   `migrations/0001_init.sql` را اجرا کنید (یا از تب Migrations).
-4. به Worker برگردید → **Settings** → **Bindings** → **Add** → **D1 database**:
-   - Variable name: `DB`
-   - Database: `insta-worker-db`
+> اگر KV را وصل نکنید، سرویس باز هم کار می‌کند: کش و محدودیت نرخ به‌صورت
+> graceful رد می‌شوند و `/health` مقدار `storage.kv: false` را نشان می‌دهد.
 
-> اولین درخواست هم schema را idempotent اعمال می‌کند؛ اجرای دستی فقط برای
-> اطمینان و برای Cron است.
+### ۲.۳ دیتابیس/Cron لازم نیست
+هیچ D1، migration، آمار یا Cron trigger وجود ندارد. فقط KV کافی است.
 
-### ۲.۴ متغیرها
-**Settings** → **Variables and Secrets** → بخش Variables:
+### ۲.۴ متغیرها (اختیاری)
+**Settings** → **Variables and Secrets** → بخش Variables. همهٔ مقادیر پیش‌فرض
+امن دارند؛ افزودن آن‌ها اختیاری است.
 
 | نام | مقدار پیشنهادی |
 |---|---|
@@ -84,21 +84,21 @@ npm run bundle       # ساخت dist/worker.js تک‌فایلی
 | `RATE_LIMIT_PER_MINUTE` | `60` |
 | `RATE_LIMIT_DOWNLOAD_PER_MINUTE` | `20` |
 | `RATE_LIMIT_THUMBNAIL_PER_MINUTE` | `60` |
-| `RATE_LIMIT_ADMIN_PER_MINUTE` | `10` |
 | `RATE_LIMIT_HEALTH_PER_MINUTE` | `10` |
 | `MAX_DOWNLOAD_MB` | `80` |
 | `CACHE_TTL_SECONDS` | `120` |
 | `UPSTREAM_TIMEOUT_MS` | `12000` |
-| `DEFAULT_LANG` | `fa` |
-| `CDN_ALLOWLIST` | `*.cdninstagram.com,*.fbcdn.net,*.instagram.com,*.facebook.com` |
-| `CONTACT_URL` | لینک تماس/حذف محتوا |
+| `CDN_ALLOWLIST` | `*.cdninstagram.com,*.fbcdn.net` |
+| `ALLOWED_ORIGINS` | `*` یا فهرست Origin با کاما |
 
-### ۲.۵ Secretها
+### ۲.۵ Secretها (همه اختیاری)
 **Settings** → **Variables and Secrets** → **Add** → نوع **Secret**:
 
-- `ADMIN_TOKEN` — یک رشتهٔ تصادفی بلند (حداقل ۳۲ کاراکتر).
+- `API_KEYS` — کلیدها با کاما. اگر تنظیم شود، همهٔ `/api/v1/*` به
+  `Authorization: Bearer <key>` یا `x-api-key: <key>` نیاز دارند. بدون آن API
+  عمومی و بر اساس IP محدود است.
 - `UPSTREAM_TOKEN` — فقط اگر provider شما توکن می‌خواهد.
-- `IP_HASH_SECRET` — یک رشتهٔ تصادفی دیگر (حداقل ۱۶ کاراکتر).
+- `IP_HASH_SECRET` — یک رشتهٔ تصادفی دیگر (حداقل ۱۶ کاراکتر) برای HMAC آدرس IP.
 
 ساخت مقدار تصادفی در ترمینال:
 
@@ -106,12 +106,9 @@ npm run bundle       # ساخت dist/worker.js تک‌فایلی
 openssl rand -hex 32
 ```
 
-> `IP_HASH_SECRET` را حتماً تنظیم کنید. بدون آن یک مقدار پیش‌فرض عمومی استفاده
-> می‌شود و bucketهای IP بین deploymentها قابل مقایسه می‌شوند.
-
-### ۲.۶ Cron (پاکسازی آمار)
-در Dashboard برای Worker → **Settings** → **Triggers** → **Cron Triggers** →
-`0 3 * * *` را اضافه کنید. این کار رکوردهای قدیمی `stats` را روزانه پاک می‌کند.
+> `IP_HASH_SECRET` را در production تنظیم کنید. بدون آن یک مقدار پیش‌فرض عمومی
+> استفاده می‌شود و bucketهای IP بین deploymentها قابل مقایسه می‌شوند. هیچ‌کدام
+> از این Secretها برای بالا آمدن سرویس لازم نیستند.
 
 ---
 
@@ -119,40 +116,41 @@ openssl rand -hex 32
 
 ```bash
 npx wrangler login
-npx wrangler kv namespace create CACHE
-npx wrangler d1 create insta-worker-db
-npx wrangler d1 migrations apply insta-worker-db --remote
-npx wrangler secret put ADMIN_TOKEN
-npx wrangler secret put IP_HASH_SECRET
-# اختیاری:
-# npx wrangler secret put UPSTREAM_TOKEN
 npx wrangler deploy
 ```
 
-سپس `wrangler.toml` را باز کنید و شناسه‌های واقعی را جای‌گذاری کنید:
+`wrangler.toml` از قبل binding `KV` را بدون `id` دارد؛ Wrangler >= ۳.۶۰ فضای KV
+را خودکار می‌سازد. اگر می‌خواهید از یک namespace موجود استفاده کنید:
+
+```bash
+npx wrangler kv namespace create KV
+```
+
+سپس شناسهٔ خروجی را در `wrangler.toml` جای‌گذاری کنید:
 
 ```toml
 [[kv_namespaces]]
-binding = "CACHE"
+binding = "KV"
 id = "<KV_NAMESPACE_ID>"
-
-[[d1_databases]]
-binding = "DB"
-database_name = "insta-worker-db"
-database_id = "<D1_DATABASE_ID>"
-migrations_dir = "migrations"
 ```
 
-> در `wrangler.toml` هیچ `preview_id` یا `preview_database_id` ساختگی نگذارید؛
-> Wrangler جدید خودش پیش‌نمایش محلی را مدیریت می‌کند. اگر از `wrangler dev`
-> استفاده می‌کنید و خطای binding گرفتید، بخش `[env.preview]` را فقط در صورت
-> نیاز اضافه کنید.
+Secretهای اختیاری:
+
+```bash
+# فقط در صورت نیاز؛ هیچ‌کدام اجباری نیست
+npx wrangler secret put API_KEYS
+npx wrangler secret put IP_HASH_SECRET
+npx wrangler secret put UPSTREAM_TOKEN
+```
+
+> در `wrangler.toml` هیچ `preview_id` ساختگی نگذارید؛ Wrangler جدید پیش‌نمایش
+> محلی را خودش مدیریت می‌کند.
 
 بررسی سلامت و لاگ:
 
 ```bash
 npx wrangler tail
-curl -s "https://<worker-domain>/health?deep=1" | head -c 800
+curl -s "https://<worker-domain>/health?deep=1"
 ```
 
 ---
@@ -163,8 +161,9 @@ curl -s "https://<worker-domain>/health?deep=1" | head -c 800
 2. Cloudflare Dashboard → **Workers & Pages** → **Create** → **Connect to Git**.
 3. مخزن و شاخهٔ `main` را انتخاب کنید.
 4. Build command را خالی بگذارید و Deploy command را
-   `npx wrangler deploy` قرار دهید (یا مطابق تنظیمات پروژه).
-5. KV/D1 را در **Settings → Bindings** وصل کنید و متغیرها/Secretها را وارد کنید.
+   `npx wrangler deploy` قرار دهید.
+5. KV را در **Settings → Bindings** وصل کنید (نام متغیر: `KV`) و در صورت نیاز
+   متغیرها/Secretها را وارد کنید.
 6. هر push به `main` خودکار deploy می‌شود.
 
 > اگر می‌خواهید فقط با تگ/دستی deploy شود، در تنظیمات Git integration شاخه را
@@ -175,7 +174,9 @@ curl -s "https://<worker-domain>/health?deep=1" | head -c 800
 ## ۵) روش ه — GitHub Actions
 
 فایل `.github/workflows/deploy.yml` فقط با **workflow_dispatch** اجرا می‌شود و
-اگر Secretها ناقص باشند با خطای صریح متوقف می‌شود (deploy سبزِ الکی نداریم).
+اگر Secretهای لازم GitHub ناقص باشند با خطای صریح متوقف می‌شود (deploy سبزِ
+الکی نداریم). این workflow فقط به دو Secret زیر نیاز دارد و هیچ Secret
+برنامه‌ای (`API_KEYS` و…) را از GitHub به Worker منتقل نمی‌کند.
 
 ### ۵.۱ ساخت API Token در Cloudflare
 **My Profile** → **API Tokens** → **Create Token** → **Custom token**:
@@ -183,7 +184,6 @@ curl -s "https://<worker-domain>/health?deep=1" | head -c 800
 - Permissions:
   - `Account` → `Workers Scripts` → **Edit**
   - `Account` → `Workers KV Storage` → **Edit**
-  - `Account` → `D1` → **Edit**
   - `Account` → `Account Settings` → **Read** (برای Account ID)
 - Account Resources: حساب خودتان
 - Zone Resources: فقط اگر از Custom Domain/Route استفاده می‌کنید، Zone مربوطه
@@ -196,12 +196,9 @@ curl -s "https://<worker-domain>/health?deep=1" | head -c 800
 |---|---|
 | `CLOUDFLARE_API_TOKEN` | توکن بخش ۵.۱ |
 | `CLOUDFLARE_ACCOUNT_ID` | از Dashboard → Workers → Account ID |
-| `ADMIN_TOKEN` | همان مقدار Secret ورکر |
-| `IP_HASH_SECRET` | همان مقدار Secret ورکر |
-| `UPSTREAM_TOKEN` | اختیاری |
 
-> Workflow این مقادیر را با `wrangler secret put` روی Worker تنظیم می‌کند؛
-> لازم نیست جداگانه در Dashboard وارد شوند.
+> Secretهای اختیاری سرویس (`API_KEYS`، `IP_HASH_SECRET`، `UPSTREAM_TOKEN`) را
+> جداگانه در Dashboard ورکر یا با `wrangler secret put` تنظیم کنید.
 
 ### ۵.۳ Environment
 یک Environment به نام `production` بسازید (Settings → Environments) و در صورت
@@ -231,38 +228,38 @@ Workflow ابتدا job `check` را اجرا می‌کند (`npm ci`، `npm run
 ## ۷) چک‌لیست تأیید
 
 ```bash
-# 1) صفحهٔ اصلی (باید 200 و CSP بدون unsafe-inline بدهد)
-curl -sI "https://<worker-domain>/" | grep -iE "^(HTTP|content-security-policy|cache-control)"
+# 1) ریشه باید JSON بدهد (نه HTML)
+curl -sI "https://<worker-domain>/" | grep -iE "^(HTTP|content-type|cache-control)"
+curl -s "https://<worker-domain>/" | head -c 300
 
 # 2) سلامت
 curl -s "https://<worker-domain>/health?deep=1"
 
 # 3) سند API
-curl -s "https://<worker-domain>/openapi.json" | head -c 300
+curl -s "https://<worker-domain>/openapi.json" | head -c 200
 
 # 4) resolve یک لینک عمومی
 curl -s "https://<worker-domain>/api/v1/resolve?url=https://www.instagram.com/reel/ABC123/"
 
-# 5) محدودیت نرخ (باید 429 با Retry-After بدهد)
+# 5) دانلود (هدرهای پاسخ)
+curl -sI "https://<worker-domain>/api/v1/download?url=https://www.instagram.com/reel/ABC123/"
+
+# 6) محدودیت نرخ (باید 429 با Retry-After بدهد)
 for i in $(seq 1 70); do curl -s -o /dev/null -w "%{http_code}\n" \
   "https://<worker-domain>/api/v1/resolve?url=https://www.instagram.com/reel/ABC123/"; done | sort | uniq -c
 
-# 6) ادمین بدون توکن (باید 401 بدهد)
-curl -s -i "https://<worker-domain>/api/v1/admin/keys" | head -5
-
-# 7) ادمین با توکن
-curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
-  "https://<worker-domain>/api/v1/admin/keys"
+# 7) فقط اگر API_KEYS تنظیم شده است (باید 401 بدهد)
+curl -s -i "https://<worker-domain>/api/v1/resolve?url=https://www.instagram.com/reel/ABC123/" | head -5
 ```
 
 انتظار:
-- `/` → `200`, `cache-control: private, no-store`, CSP شامل `nonce-...` و بدون
-  `unsafe-inline`.
-- `/health?deep=1` → `200` با `ok:true` و وضعیت providerها.
+- `/` → `200` با `content-type: application/json` و `cache-control: private, no-store`.
+- `/health?deep=1` → `200` با `ok:true`، `storage.kv` و وضعیت providerها.
 - `/openapi.json` → `200` و JSON معتبر.
-- resolve → `200` با `data.variants` غیرخالی یا خطای ساختاریافتهٔ روشن.
+- resolve → `200` با `data.items` غیرخالی یا خطای ساختاریافتهٔ روشن.
 - درخواست‌های بیش از سقف → `429` و هدر `Retry-After`.
-- ادمین بدون توکن → `401`؛ با توکن → `200`.
+- اگر `API_KEYS` تنظیم شده باشد، درخواست بدون کلید → `401` با
+  `WWW-Authenticate: Bearer`؛ با کلید درست → `200`.
 
 ---
 
@@ -272,9 +269,9 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
 
 1. Cloudflare → **My Profile** → **API Tokens** → توکن مربوطه → **Roll/Delete**.
 2. GitHub → **Settings → Secrets** → مقدار جدید را ذخیره کنید.
-3. روی Worker:
+3. روی Worker، در صورت استفاده:
    ```bash
-   npx wrangler secret put ADMIN_TOKEN
+   npx wrangler secret put API_KEYS
    npx wrangler secret put IP_HASH_SECRET
    ```
 4. اگر `UPSTREAM_TOKEN` لو رفته، آن را در پنل provider هم باطل کنید.
@@ -289,20 +286,20 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
 
 | نشانه | علت محتمل | راه‌حل |
 |---|---|---|
-| `500` روی همهٔ مسیرها | binding یا schema ناقص | `/health?deep=1` و لاگ `wrangler tail` |
+| `500` روی همهٔ مسیرها | خطای غیرمنتظره/کانفیگ | `/health` و `wrangler tail` |
 | `E_UPSTREAM_FAILED` | provider قطع/تغییر شکل پاسخ | `UPSTREAM_URLS` و health عمیق |
+| `E_UPSTREAM_TIMEOUT` | کندی/قطعی provider | `UPSTREAM_TIMEOUT_MS` یا provider |
 | `E_NOT_ALLOWED_HOST` | CDN در allowlist نیست | `CDN_ALLOWLIST` را به‌روز کنید |
-| `429` زودهنگام | سقف پایین یا IP مشترک | سقف را بالا ببرید یا API Key بسازید |
-| صفحه بدون استایل | CSP یا nonce اشتباه | `/?debug=1` و CSP پاسخ را ببینید |
+| `429` زودهنگام | سقف پایین یا IP مشترک | سقف را بالا ببرید یا `API_KEYS` را فعال کنید |
+| `401` ناخواسته | `API_KEYS` تنظیم شده | کلید درست را در `Bearer`/`x-api-key` بفرستید |
 | دانلود نیمه‌کاره | سقف `MAX_DOWNLOAD_MB` یا timeout | سقف/`UPSTREAM_TIMEOUT_MS` را تنظیم کنید |
-| آمار خالی | D1 وصل نیست | binding `DB` و اجرای migration |
-| کش کار نمی‌کند | KV وصل نیست | binding `CACHE` |
-| Cron اجرا نمی‌شود | trigger ثبت نشده | `[triggers]` در `wrangler.toml` یا Dashboard |
+| `storage.kv: false` | binding `KV` وصل نیست | بخش ۲.۲ را انجام دهید (سرویس بدون آن هم کار می‌کند) |
+| کش کار نمی‌کند | KV وصل نیست | binding `KV` |
 
 ### لاگ‌های امن
 - هرگز کل توکن را لاگ نکنید؛ در صورت نیاز فقط ۶ کاراکتر اول/آخر.
-- `ADMIN_TOKEN` تنها با مقایسهٔ `timingSafeEqual` بررسی می‌شود.
-- API Keyها فقط به‌صورت هش ذخیره می‌شوند و لیست ادمین هیچ هشی برنمی‌گرداند.
+- API keyها فقط با `timingSafeEqual` مقایسه می‌شوند و کلید خام ذخیره نمی‌شود.
+- IP فقط به‌صورت HMAC-SHA256 در KV می‌نشیند، نه خام.
 
 ---
 
@@ -310,9 +307,9 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
 
 ```bash
 npx wrangler delete
+# اختیاری: حذف namespace ساخته‌شده
 npx wrangler kv namespace delete --namespace-id <KV_ID>
-npx wrangler d1 delete insta-worker-db
 ```
 
-> قبل از حذف D1، در صورت نیاز backup بگیرید:
-> `npx wrangler d1 export insta-worker-db --output backup.sql --remote`
+> قبل از حذف KV، در صورت نیاز backup بگیرید:
+> `npx wrangler kv key list --namespace-id <KV_ID>`

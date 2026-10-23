@@ -1,6 +1,8 @@
 # insta-worker
 
-> Independent Instagram public-content **resolver & downloader** that runs as a single **Cloudflare Worker**. Public content only: no cookies, no login, no private media.
+> API-only Instagram public-content resolver and media proxy on a single
+> **Cloudflare Worker**. Public content only: no login, no cookies, no private
+> media, no UI.
 
 [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Alimsv-d/insta-worker)
 
@@ -11,153 +13,203 @@
 ## English
 
 ### What it is
-A framework-free Cloudflare Worker that turns a public Instagram link into a rich
-preview plus a clean, streamed download. It ships a bilingual (fa/en) web UI, a
-versioned JSON API, rate limiting, a short metadata cache and anonymous stats.
+A small Cloudflare Worker with a versioned JSON API. It resolves a public
+Instagram post, reel or IGTV link into normalised metadata and streams the media
+through a hardened proxy. There is no frontend, no database and no mandatory
+secret: the Deploy button works without filling any field.
+
+### API surface
+| Method | Path | Description |
+|---|---|---|
+| GET | `/` | Service name, version and endpoint list |
+| GET | `/api/v1/resolve?url=&lang=` | Metadata, items and variants |
+| GET | `/api/v1/download?url=&quality=&index=&inline=&lang=` | Streamed media |
+| GET | `/api/v1/thumbnail?url=&lang=` | Image-only proxy for thumbnails |
+| GET | `/health?deep=1` | Service, storage, limits and provider state |
+| GET | `/openapi.json` | OpenAPI 3 document |
+| OPTIONS | any | CORS preflight (`204`) |
+
+`HEAD` is supported on every `GET` route. `lang` only changes API error text:
+English is the default, `?lang=fa` selects Persian.
 
 ### Features
-- **Rich preview**: thumbnail, author, caption, type (video/photo/album), item
-  count, duration, dimensions and approximate size.
-- **Honest quality picker**: every variant the upstream actually returns. Best is
-  the default; if only one version exists the UI says so instead of inventing
-  fake qualities.
-- **Albums / carousels**: preview every item, download individually, or build a
-  ZIP **in the browser** with a streaming writer (constant memory, stable order,
-  partial-failure report).
-- **Secure streaming proxy**: strong `ETag`, HTTP **Range** pass-through,
-  `Content-Disposition: attachment` by default and `inline` for the in-page
-  player (`?inline=1`). The body is streamed, never buffered.
-- **Bilingual UI** (fa/en, auto RTL/LTR), light/dark theme, responsive layout,
-  local history, copy/share and a report link.
-- **Hardened by construction**:
-  - CSP without `unsafe-inline`, separate per-request nonces for the inline
-    `<script>` and `<style>`;
-  - HTML and API responses that carry a nonce/rate-limit headers are
-    `private, no-store`;
-  - the proxy is HTTPS-only, allowlisted, rejects private/loopback/link-local
-    IPv4 **and** IPv6, re-validates every redirect hop, caps the body by real
-    bytes and applies idle/total timeouts;
-  - IPs are never stored raw: only an HMAC-SHA256 bucket key is kept in KV.
-- **Versioned API** with a standard JSON envelope, CORS, ETag/304, structured
-  error codes and an OpenAPI document.
+- **Stable JSON envelope** for success and errors, a `request_id` in the body
+  and in `X-Request-Id`, and OpenAPI at `/openapi.json`.
+- **Honest variants**: only the qualities the upstream really returns. `best`
+  is the first variant; the API never invents resolutions or bitrates.
+- **Hardened streaming proxy**: HTTPS-only, CDN allowlist, manual redirect
+  validation (max 3 hops), private/loopback/link-local IPv4 and IPv6 blocked,
+  real byte cap, idle + total timeouts, Range pass-through and
+  `X-Content-Type-Options: nosniff`.
+- **Media-only responses**: HTML/SVG/XML are rejected; thumbnails must resolve
+  to `image/*`.
+- **KV-backed rate limiting and metadata cache**, keyed by an HMAC of the client
+  IP or API key. Raw IPs and raw keys are never stored.
+- **Optional static API keys** (`API_KEYS`) and **optional upstream token**;
+  nothing is required to deploy.
+- **CORS** via `ALLOWED_ORIGINS` (default `*`).
+- **Private caching semantics**: resolve and error responses are
+  `private, no-store`; resolve carries a strong `ETag` and answers
+  `If-None-Match` with `304`. Thumbnails are `private, max-age=300` and never
+  `immutable`.
 
 ### Architecture
 ```
 request ──► router (src/worker.js)
-             ├─ /                single-file UI (src/lib/ui.js)
-             ├─ /api/v1/resolve  metadata + variants (cached in KV)
-             ├─ /api/v1/download streamed proxy (Range, size cap, inline)
-             ├─ /api/v1/thumbnail safe image proxy
-             ├─ /api/v1/admin/*  ADMIN_TOKEN protected API keys
-             ├─ /health          service + provider health (deep=1)
-             ├─ /openapi.json    OpenAPI 3 document
-             └─ /robots.txt
+             ├─ /                  JSON service summary
+             ├─ /api/v1/resolve    metadata + variants (KV cache + ETag)
+             ├─ /api/v1/download   streamed media (Range, size cap, inline)
+             ├─ /api/v1/thumbnail  image-only proxy
+             ├─ /health            health + optional deep provider probe
+             └─ /openapi.json      OpenAPI 3 document
 
-providers (src/lib/providers.js): ordered UPSTREAM_URLS, per-call timeout,
-retry with jitter, per-URL circuit breaker (one half-open probe), health map.
+providers (src/lib/providers.js): ordered UPSTREAM_URLS, whole-call timeout,
+retry with jitter, per-URL circuit breaker (one half-open probe).
 normalize (src/lib/normalize.js): one shape for every upstream.
 security (src/lib/security.js): SSRF guards + streaming proxy.
-storage (src/lib/storage.js): KV rate limit/cache, HMAC IP hashing, D1 stats
-and optional API keys. A Cron trigger purges old stats.
+storage  (src/lib/storage.js): KV rate limit/cache, HMAC buckets, ETag.
+http     (src/lib/http.js): envelope, CORS, cache headers, status mapping.
 ```
 
 ### Deploy
 
-**One-click:** click the button above, authorize Cloudflare and deploy. KV and D1
-are auto-provisioned (Wrangler >= 3.60). The first request applies the schema
-idempotently; the same statements live in `migrations/0001_init.sql`.
+**One-click:** click the button above and deploy. No field is mandatory and no
+D1/database is created. Wrangler >= 3.60 auto-provisions the KV namespace; with
+older Wrangler, create it manually (see [SETUP-MANUAL.md](./SETUP-MANUAL.md)).
 
 **Manual:** see **[SETUP-MANUAL.md](./SETUP-MANUAL.md)** for the dashboard,
-Wrangler, GitHub → Cloudflare integration and the GitHub Actions workflow.
+Wrangler, GitHub → Cloudflare integration and the optional GitHub Actions
+workflow.
 
-**Single-file bundle** (for Dashboard *Quick edit* or a custom pipeline):
+**Single-file bundle** (Dashboard *Quick edit* or a custom pipeline):
 ```bash
-npm install
+npm install --no-audit --no-fund
 npm run bundle        # -> dist/worker.js (ESM, git-ignored)
 npm run bundle:min    # minified
 ```
 
 ### Configuration
-Worker variables (`wrangler.toml` → `[vars]` or Dashboard → Settings → Variables):
+Non-sensitive variables (`wrangler.toml` → `[vars]`, or Dashboard → Settings →
+Variables). Every value has a safe default.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `UPSTREAM_URLS` | `https://catplus.ir/api/insta` | Comma-separated, ordered providers |
+| `UPSTREAM_URLS` | `https://catplus.ir/api/insta` | Comma-separated ordered providers (https only) |
 | `RATE_LIMIT_PER_MINUTE` | `60` | Resolve requests / minute / bucket |
 | `RATE_LIMIT_DOWNLOAD_PER_MINUTE` | `20` | Download requests / minute |
-| `RATE_LIMIT_THUMBNAIL_PER_MINUTE` | `60` | Thumbnail proxy requests / minute |
-| `RATE_LIMIT_ADMIN_PER_MINUTE` | `10` | Admin requests / minute |
+| `RATE_LIMIT_THUMBNAIL_PER_MINUTE` | `60` | Thumbnail requests / minute |
 | `RATE_LIMIT_HEALTH_PER_MINUTE` | `10` | Deep health requests / minute |
 | `MAX_DOWNLOAD_MB` | `80` | Hard cap for a proxied download |
-| `CDN_ALLOWLIST` | `*.cdninstagram.com,*.fbcdn.net,*.instagram.com,*.facebook.com` | Allowed proxy hosts |
-| `CONTACT_URL` | repo issues | Contact / takedown link |
-| `CACHE_TTL_SECONDS` | `120` | Metadata cache TTL (min 60, max 900) |
+| `CDN_ALLOWLIST` | `*.cdninstagram.com,*.fbcdn.net` | Allowed proxy hosts |
+| `ALLOWED_ORIGINS` | `*` | `*` or a comma-separated origin list |
+| `CACHE_TTL_SECONDS` | `120` | Metadata cache TTL (clamped to 60..900) |
 | `UPSTREAM_TIMEOUT_MS` | `12000` | Per-provider timeout (headers + body) |
-| `DEFAULT_LANG` | `fa` | Default UI/API language |
 
-Secrets (never commit):
-- `ADMIN_TOKEN` — protects `/api/v1/admin/*`.
-- `UPSTREAM_TOKEN` — optional bearer token; only sent to `UPSTREAM_TOKEN_HOST`
-  (or to the single configured provider when no host is set).
-- `IP_HASH_SECRET` — >= 16 chars. Keys the HMAC used for IP buckets. A public
-  default is used when unset, so set this in production to make hashes
-  non-comparable across deployments.
+Optional secrets (Settings → Variables and Secrets → Secret, or
+`wrangler secret put <NAME>`):
+
+| Secret | Meaning |
+|---|---|
+| `API_KEYS` | Comma-separated keys. When set, every `/api/v1/*` request needs `Authorization: Bearer <key>` or `x-api-key: <key>`. |
+| `UPSTREAM_TOKEN` | Bearer token forwarded only to `UPSTREAM_TOKEN_HOST`, or to the single configured provider when no host is set. |
+| `IP_HASH_SECRET` | Random string (>= 16 chars) used to key IP buckets. A public default is used when unset; set it in production to make hashes non-comparable. |
+
+`API_KEYS` is static: keys are configured as a secret, not created through an
+admin endpoint. When it is unset the API is public and rate limited per IP.
 
 ### API reference
-Success: `{ ok:true, status:200, lang, request_id, data }`.
-Error: `{ ok:false, status, lang, request_id, error:{ code, message } }`.
-`request_id` is also returned in the `X-Request-Id` header.
+Success:
+```json
+{ "ok": true, "status": 200, "lang": "en", "request_id": "...", "data": {} }
+```
+Error:
+```json
+{ "ok": false, "status": 400, "lang": "en", "request_id": "...",
+  "error": { "code": "E_INVALID_URL", "message": "..." } }
+```
 
-| Method | Path | Description |
+Resolve `data` shape:
+```json
+{
+  "type": "video | image | album",
+  "author": { "username": "...", "full_name": "...", "avatar": "https://..." },
+  "caption": "...",
+  "thumbnail": "https://...",
+  "duration": 12.5,
+  "items": [
+    { "type": "video", "index": 0, "thumbnail": "https://...",
+      "variants": [
+        { "url": "https://...", "quality": "1080x1920", "width": 1080,
+          "height": 1920, "bitrate": 2000000, "size": 123456,
+          "mime": "video/mp4", "filename": "author_shortcode.mp4",
+          "has_audio": null }
+      ] }
+  ],
+  "source_url": "https://www.instagram.com/reel/.../",
+  "shortcode": "...",
+  "provider": "catplus.ir",
+  "variants_count": 1
+}
+```
+`has_audio` is `null` when the upstream does not say; it is never guessed. The
+filename extension always comes from the resolved MIME type.
+
+| Query | Applies to | Notes |
 |---|---|---|
-| GET | `/api/v1/resolve?url=&lang=` | Metadata + variant list |
-| GET | `/api/v1/download?url=&quality=&index=&inline=&lang=` | Streamed download / playback |
-| GET | `/api/v1/thumbnail?url=&lang=` | Proxied thumbnail |
-| GET | `/health?deep=1` | Health, providers, limits |
-| GET | `/openapi.json` | OpenAPI 3 spec |
-| GET | `/api/v1/admin/keys` | List keys (labels only) |
-| POST | `/api/v1/admin/keys` | Create/update a key (`{key,label?,limit_per_minute?}`) |
-| DELETE | `/api/v1/admin/keys` | Disable a key (`{key}`) |
+| `url` | resolve/download/thumbnail | Instagram URL or a direct CDN URL for thumbnail |
+| `index` | download | Non-negative integer, default `0` |
+| `quality` | download | Exact label from `variants[].quality`; default `best` (first) |
+| `inline` | download | `1` serves `Content-Disposition: inline` |
+| `lang` | all | `en` (default) or `fa` |
+| `deep` | health | `1` probes every provider (rate limited) |
 
-Admin requests use `Authorization: Bearer <ADMIN_TOKEN>`.
-Only a hash of each API key is stored; a disabled key can never be re-enabled.
+Status mapping: `E_INVALID_URL`/`E_INVALID_REQUEST`/`E_BAD_QUALITY`/`E_BAD_INDEX`
+/`E_NOT_ALLOWED_HOST` → 400, `E_UNAUTHORIZED` → 401, `E_NOT_FOUND`/
+`E_NO_VARIANTS`/`E_PRIVATE_OR_NOT_FOUND` → 404, `E_METHOD` → 405, `E_TOO_LARGE` →
+413, `E_NOT_ALLOWED_TYPE` → 415, `E_RATE_LIMIT` → 429, `E_UPSTREAM_FAILED`/
+`E_UPSTREAM_UNAVAILABLE` → 502, `E_UPSTREAM_TIMEOUT` → 504, `E_INTERNAL` → 500.
 
-Error codes: `E_INVALID_URL`, `E_INVALID_REQUEST`, `E_PRIVATE_OR_NOT_FOUND`,
-`E_UPSTREAM_FAILED`, `E_UPSTREAM_UNAVAILABLE`, `E_RATE_LIMIT`, `E_TOO_LARGE`,
-`E_NOT_ALLOWED_HOST`, `E_NOT_ALLOWED_TYPE`, `E_BAD_QUALITY`, `E_BAD_INDEX`,
-`E_NO_VARIANTS`, `E_METHOD`, `E_NOT_FOUND`, `E_UNAUTHORIZED`, `E_FORBIDDEN`,
-`E_KEY_DISABLED`, `E_KEY_EXISTS`, `E_INTERNAL`. Every response includes
-`X-RateLimit-*`; limited responses include `Retry-After`.
+Rate-limited responses include `Retry-After` and `X-RateLimit-*`. The limiter is
+a KV approximation (eventually consistent), not an exact global counter.
 
 **Samples**
 
 ```bash
-# curl
-curl "https://<worker>/api/v1/resolve?url=https://www.instagram.com/reel/ABC123/"
+# Resolve
+curl "https://<worker>/api/v1/resolve?url=https%3A%2F%2Fwww.instagram.com%2Freel%2FABC123%2F"
+
+# Download the best variant with a stable filename
+curl -OJ "https://<worker>/api/v1/download?url=https%3A%2F%2Fwww.instagram.com%2Freel%2FABC123%2F"
+
+# With API_KEYS configured
+curl -H "Authorization: Bearer $API_KEY" \
+  "https://<worker>/api/v1/resolve?url=https%3A%2F%2Fwww.instagram.com%2Freel%2FABC123%2F"
 ```
+
 ```python
-# Python
 import requests
-r = requests.get("https://<worker>/api/v1/resolve",
-                 params={"url": "https://www.instagram.com/reel/ABC123/"})
-print(r.json())
+
+r = requests.get(
+    "https://<worker>/api/v1/resolve",
+    params={"url": "https://www.instagram.com/reel/ABC123/"},
+    headers={"Authorization": "Bearer <key>"},  # only when API_KEYS is set
+    timeout=30,
+)
+r.raise_for_status()
+print(r.json()["data"]["items"])
 ```
-```php
-// PHP
-$j = file_get_contents("https://<worker>/api/v1/resolve?url=" .
-      urlencode("https://www.instagram.com/reel/ABC123/"));
-echo $j;
-```
+
 ```javascript
-// JavaScript
-const j = await (await fetch("https://<worker>/api/v1/resolve?url=https://www.instagram.com/reel/ABC123/")).json();
-console.log(j);
+const u = new URL("https://<worker>/api/v1/resolve");
+u.searchParams.set("url", "https://www.instagram.com/reel/ABC123/");
+const res = await fetch(u, { headers: { authorization: `Bearer ${key}` } }); // key optional
+console.log((await res.json()).data);
 ```
 
 ### Development
 ```bash
 npm install --no-audit --no-fund
-npm run check        # syntax check + 111 mocked tests (no real network)
+npm run check        # syntax checks + 97 mocked tests (no real network)
 npm test             # tests only
 npm run bundle       # single-file dist/worker.js
 npm run dev          # wrangler dev
@@ -165,28 +217,30 @@ npm run deploy       # wrangler deploy
 npm run secret-scan  # block accidental tokens before pushing
 ```
 
-The tests mock `fetch`; they cover URL parsing, normalisation, provider
-fallback/breaker, SSRF and redirect rules, streaming caps, KV/D1 helpers,
-migration/schema parity, i18n completeness, HTML/CSP and the HTTP routes.
+The tests mock `fetch` and cover URL parsing, normalisation, provider
+timeout/fallback/breaker, SSRF and redirect rules, streaming caps and MIME
+rules, KV rate limits/cache/ETag, CORS, authentication and the HTTP routes.
 
 ### Troubleshooting
-- **429** — wait for `Retry-After`, or create an API key for a higher limit.
-- **E_UPSTREAM_FAILED** — every provider failed; check `UPSTREAM_URLS` and
-  `/health?deep=1`.
-- **E_NOT_ALLOWED_HOST** — the CDN is not allowlisted; extend `CDN_ALLOWLIST`.
-- **Blank/odd page** — open `/?debug=1`; the page is server-rendered and visible
-  without JavaScript by design.
-- **D1/KV missing** — the worker degrades: caching/rate limiting or stats are
-  skipped, requests still work.
+- **401** — `API_KEYS` is set and the request has no valid `Bearer`/`x-api-key`.
+- **429** — wait for `Retry-After`; limits are per IP or API key.
+- **E_UPSTREAM_FAILED** — every provider failed or returned an unusable payload;
+  check `UPSTREAM_URLS` and `/health?deep=1`.
+- **E_UPSTREAM_TIMEOUT** — provider timeout; raise `UPSTREAM_TIMEOUT_MS` or fix
+  the provider.
+- **E_NOT_ALLOWED_HOST** — the media host is not in `CDN_ALLOWLIST`.
+- **KV missing** — the worker still serves requests; cache and rate limiting
+  degrade gracefully (`/health` shows `storage.kv: false`).
 
 ### Legal
-Personal use with public content only. The author name and source link are
-always shown; respect copyright. Use `CONTACT_URL` for DMCA/takedown requests.
-This project is independent and not affiliated with Instagram or Meta.
+Personal use with public content only. Always credit the author and link to the
+original post; respect copyright and Instagram's terms. For takedown requests,
+open an issue in this repository. This project is independent and not
+affiliated with Instagram or Meta.
 
-**Security note:** never paste tokens into chats or screenshots. If you did,
-revoke/roll them immediately (Cloudflare → My Profile → API Tokens) and update
-the GitHub secret / `wrangler secret put`.
+**Security note:** never paste tokens into chats or screenshots. If a Cloudflare
+API token leaks, roll/delete it immediately (My Profile → API Tokens) and update
+the GitHub secret or `wrangler secret put`.
 
 MIT licensed.
 
@@ -195,121 +249,200 @@ MIT licensed.
 ## فارسی
 
 ### این چیست
-یک **Cloudflare Worker** مستقل و بدون فریم‌ورک که لینک عمومی اینستاگرام را به
-پیش‌نمایش کامل و دانلود تمیز و استریمی تبدیل می‌کند. رابط وب دوزبانه (fa/en)،
-API نسخه‌دار JSON، محدودیت نرخ، کش کوتاه متادیتا و آمار ناشناس دارد.
+یک **Cloudflare Worker** کوچک با API نسخه‌دار JSON. لینک عمومی پست، ریل یا IGTV
+اینستاگرام را به متادیتای یکدست تبدیل می‌کند و رسانه را از طریق یک پروکسی امن
+استریم می‌کند. هیچ رابط وب، دیتابیس یا Secret اجباری ندارد؛ دکمهٔ Deploy بدون
+پر کردن هیچ فیلدی کار می‌کند.
+
+### مسیرهای API
+| متد | مسیر | توضیح |
+|---|---|---|
+| GET | `/` | نام، نسخه و فهرست endpointها |
+| GET | `/api/v1/resolve?url=&lang=` | متادیتا، آیتم‌ها و کیفیت‌ها |
+| GET | `/api/v1/download?url=&quality=&index=&inline=&lang=` | استریم رسانه |
+| GET | `/api/v1/thumbnail?url=&lang=` | پروکسی فقط-تصویر برای تامنیل |
+| GET | `/health?deep=1` | وضعیت سرویس، ذخیره‌سازی، محدودیت‌ها و providerها |
+| GET | `/openapi.json` | سند OpenAPI 3 |
+| OPTIONS | همه | preflight کورس (`204`) |
+
+`HEAD` روی همهٔ مسیرهای `GET` پشتیبانی می‌شود. `lang` فقط متن خطاها را عوض
+می‌کند: پیش‌فرض انگلیسی است و `?lang=fa` فارسی را انتخاب می‌کند.
 
 ### قابلیت‌ها
-- **پیش‌نمایش کامل**: تصویر بندانگشتی، صاحب محتوا، کپشن، نوع
-  (ویدیو/عکس/آلبوم)، تعداد آیتم، مدت، ابعاد و حجم تقریبی.
-- **انتخاب کیفیت صادقانه**: فقط کیفیت‌هایی که upstream واقعاً برمی‌گرداند.
-  بهترین گزینه پیش‌فرض است؛ اگر فقط یک نسخه باشد صادقانه اعلام می‌شود.
-- **آلبوم**: نمایش همهٔ آیتم‌ها، دانلود تکی یا ساخت ZIP **در مرورگر** با
-  نویسندهٔ استریمی (حافظهٔ ثابت، ترتیب پایدار، گزارش خطای ناقص).
-- **پروکسی امن استریمی**: `ETag` قوی، پشتیبانی کامل از **Range**،
-  `Content-Disposition: attachment` به‌صورت پیش‌فرض و `inline` برای پلیر
-  (`?inline=1`). بدنه استریم می‌شود و هرگز کامل در حافظه نمی‌نشیند.
-- **رابط دوزبانه** (فارسی/انگلیسی، RTL/LTR خودکار)، تم روشن/تیره، ریسپانسیو،
-  تاریخچهٔ محلی، کپی/اشتراک و لینک گزارش محتوا.
-- **امنیت از پایه**:
-  - CSP بدون `unsafe-inline` با nonce جداگانه برای `<script>` و `<style>`؛
-  - پاسخ‌های HTML و API که nonce یا هدر محدودیت نرخ دارند `private, no-store`
-    هستند؛
-  - پروکسی فقط HTTPS و allowlist، رد IPv4/IPv6 خصوصی/loopback/link-local،
-    اعتبارسنجی هر hop ریدایرکت، سقف حجم واقعی و timeout بیکاری/کلی؛
-  - IP خام هرگز ذخیره نمی‌شود؛ فقط کلید HMAC-SHA256 در KV می‌ماند.
-- **API نسخه‌دار** با پاسخ JSON یکدست، CORS، ETag/304، کدهای خطای مشخص و
-  سند OpenAPI.
+- **پاسخ JSON یکدست** برای موفقیت و خطا، `request_id` در بدنه و هدر
+  `X-Request-Id`، و OpenAPI روی `/openapi.json`.
+- **کیفیت‌های صادقانه**: فقط کیفیت‌هایی که upstream واقعاً برمی‌گرداند؛ `best`
+  یعنی اولین variant و API هیچ رزولوشن/بیت‌ریتی از خودش نمی‌سازد.
+- **پروکسی استریمی سخت‌شده**: فقط HTTPS، allowlist سی‌دی‌ان، اعتبارسنجی دستی
+  هر hop ریدایرکت (حداکثر ۳)، رد IPv4/IPv6 خصوصی/loopback/link-local، سقف حجم
+  واقعی، timeout بیکاری و کلی، پشتیبانی Range و `X-Content-Type-Options: nosniff`.
+- **فقط رسانه**: HTML/SVG/XML رد می‌شود و تامنیل باید `image/*` باشد.
+- **محدودیت نرخ و کش متادیتا روی KV** با کلید HMAC از IP یا API key؛ IP خام و
+  کلید خام هرگز ذخیره نمی‌شوند.
+- **API keyهای ثابت اختیاری** (`API_KEYS`) و **توکن اختیاری upstream**؛ برای
+  استقرار هیچ‌کدام لازم نیست.
+- **کورس** با `ALLOWED_ORIGINS` (پیش‌فرض `*`).
+- **کش خصوصی**: پاسخ‌های resolve و خطاها `private, no-store` هستند؛ resolve
+  یک `ETag` قوی دارد و به `If-None-Match` با `304` پاسخ می‌دهد. تامنیل
+  `private, max-age=300` است و هرگز `immutable` نمی‌شود.
 
 ### معماری
 ```
 request ──► router (src/worker.js)
-             ├─ /                رابط تک‌فایلی (src/lib/ui.js)
-             ├─ /api/v1/resolve  متادیتا + کیفیت‌ها (کش KV)
-             ├─ /api/v1/download پروکسی استریمی (Range، سقف حجم، inline)
-             ├─ /api/v1/thumbnail پروکسی امن تصویر
-             ├─ /api/v1/admin/*  مدیریت API Key با ADMIN_TOKEN
-             ├─ /health          وضعیت سرویس/providerها (deep=1)
-             ├─ /openapi.json    سند OpenAPI 3
-             └─ /robots.txt
+             ├─ /                  خلاصهٔ JSON سرویس
+             ├─ /api/v1/resolve    متادیتا + کیفیت‌ها (کش KV + ETag)
+             ├─ /api/v1/download   استریم رسانه (Range، سقف حجم، inline)
+             ├─ /api/v1/thumbnail  پروکسی فقط-تصویر
+             ├─ /health            وضعیت + بررسی عمیق اختیاری
+             └─ /openapi.json      سند OpenAPI 3
 
-providerها (src/lib/providers.js): UPSTREAM_URLS به‌ترتیب اولویت، timeout
-هر فراخوانی، retry با jitter، circuit breaker بر اساس URL کامل (یک probe در
-half-open) و نقشهٔ سلامت.
+providers (src/lib/providers.js): UPSTREAM_URLS به‌ترتیب، timeout کل فراخوانی،
+retry با jitter، circuit breaker بر اساس URL کامل (یک probe در half-open).
 normalize (src/lib/normalize.js): یک شکل یکدست برای همهٔ upstreamها.
 security (src/lib/security.js): محافظ SSRF + پروکسی استریمی.
-storage (src/lib/storage.js): rate limit/کش در KV، هش HMAC آدرس IP، آمار D1
-و API Key اختیاری. یک Cron trigger آمار قدیمی را پاک می‌کند.
+storage  (src/lib/storage.js): rate limit/کش KV، bucket HMAC، ETag.
+http     (src/lib/http.js): پاکت پاسخ، کورس، هدرهای کش، نگاشت وضعیت.
 ```
 
 ### استقرار
-**یک‌کلیکی:** روی دکمهٔ بالا بزنید، به Cloudflare اجازه دهید و منتشر کنید. KV و
-D1 خودکار ساخته می‌شوند (Wrangler >= 3.60). اولین درخواست schema را به‌صورت
-idempotent اعمال می‌کند؛ همان دستورها در `migrations/0001_init.sql` هستند.
+**یک‌کلیکی:** روی دکمهٔ بالا بزنید و Deploy کنید. هیچ فیلدی اجباری نیست و هیچ
+D1/دیتابیسی ساخته نمی‌شود. Wrangler >= 3.60 فضای KV را خودکار می‌سازد؛ با نسخهٔ
+قدیمی‌تر آن را دستی بسازید (راهنما در [SETUP-MANUAL.md](./SETUP-MANUAL.md)).
 
-**دستی:** راهنمای کامل در **[SETUP-MANUAL.md](./SETUP-MANUAL.md)** (Dashboard،
-Wrangler، اتصال GitHub به Cloudflare و GitHub Actions).
+**دستی:** راهنمای کامل در **[SETUP-MANUAL.md](./SETUP-MANUAL.md)** برای
+Dashboard، Wrangler، اتصال GitHub به Cloudflare و workflow اختیاری GitHub
+Actions.
 
 **بستهٔ تک‌فایلی** (برای *Quick edit* در Dashboard یا pipeline دلخواه):
 ```bash
-npm install
+npm install --no-audit --no-fund
 npm run bundle        # -> dist/worker.js (ESM، در git نادیده گرفته می‌شود)
 npm run bundle:min    # نسخهٔ minified
 ```
 
-### متغیرهای محیطی
+### پیکربندی
+متغیرهای غیرحساس (`wrangler.toml` → `[vars]` یا Dashboard → Settings →
+Variables). همهٔ مقادیر پیش‌فرض امن دارند.
+
 | متغیر | پیش‌فرض | توضیح |
 |---|---|---|
-| `UPSTREAM_URLS` | `https://catplus.ir/api/insta` | providerها با کاما و ترتیب اولویت |
+| `UPSTREAM_URLS` | `https://catplus.ir/api/insta` | providerها با کاما و ترتیب اولویت (فقط https) |
 | `RATE_LIMIT_PER_MINUTE` | `60` | درخواست resolve در دقیقه بر bucket |
 | `RATE_LIMIT_DOWNLOAD_PER_MINUTE` | `20` | درخواست دانلود در دقیقه |
-| `RATE_LIMIT_THUMBNAIL_PER_MINUTE` | `60` | درخواست تصویر بندانگشتی در دقیقه |
-| `RATE_LIMIT_ADMIN_PER_MINUTE` | `10` | درخواست ادمین در دقیقه |
+| `RATE_LIMIT_THUMBNAIL_PER_MINUTE` | `60` | درخواست تامنیل در دقیقه |
 | `RATE_LIMIT_HEALTH_PER_MINUTE` | `10` | درخواست health عمیق در دقیقه |
 | `MAX_DOWNLOAD_MB` | `80` | سقف سخت دانلود پروکسی |
-| `CDN_ALLOWLIST` | `*.cdninstagram.com,*.fbcdn.net,...` | میزبان‌های مجاز پروکسی |
-| `CONTACT_URL` | Issues مخزن | لینک تماس/حذف |
-| `CACHE_TTL_SECONDS` | `120` | TTL کش متادیتا (حداقل ۶۰، حداکثر ۹۰۰) |
+| `CDN_ALLOWLIST` | `*.cdninstagram.com,*.fbcdn.net` | میزبان‌های مجاز پروکسی |
+| `ALLOWED_ORIGINS` | `*` | `*` یا فهرست Origin با کاما |
+| `CACHE_TTL_SECONDS` | `120` | TTL کش متادیتا (محدود به ۶۰ تا ۹۰۰) |
 | `UPSTREAM_TIMEOUT_MS` | `12000` | timeout هر provider (هدر + بدنه) |
-| `DEFAULT_LANG` | `fa` | زبان پیش‌فرض رابط/API |
 
-Secretها (هرگز commit نشوند):
-- `ADMIN_TOKEN` — محافظ `/api/v1/admin/*`.
-- `UPSTREAM_TOKEN` — توکن اختیاری؛ فقط به `UPSTREAM_TOKEN_HOST` (یا تنها
-  provider پیکربندی‌شده) فرستاده می‌شود.
-- `IP_HASH_SECRET` — حداقل ۱۶ کاراکتر؛ کلید HMAC آدرس IP. اگر تنظیم نشود یک
-  مقدار پیش‌فرض عمومی استفاده می‌شود، پس در production آن را تنظیم کنید.
+Secretهای اختیاری (Settings → Variables and Secrets → Secret یا
+`wrangler secret put <NAME>`):
+
+| Secret | توضیح |
+|---|---|
+| `API_KEYS` | کلیدها با کاما. اگر تنظیم شود، همهٔ `/api/v1/*` به `Authorization: Bearer <key>` یا `x-api-key: <key>` نیاز دارند. |
+| `UPSTREAM_TOKEN` | توکن Bearer که فقط به `UPSTREAM_TOKEN_HOST` (یا تنها provider پیکربندی‌شده) فرستاده می‌شود. |
+| `IP_HASH_SECRET` | رشتهٔ تصادفی (حداقل ۱۶ کاراکتر) برای کلید HMAC آدرس IP. اگر تنظیم نشود یک مقدار پیش‌فرض عمومی استفاده می‌شود. |
+
+`API_KEYS` ثابت است: کلیدها به‌صورت Secret تنظیم می‌شوند و endpoint ادمین برای
+ساخت/حذف کلید وجود ندارد. وقتی تنظیم نشده باشد API عمومی است و بر اساس IP
+محدود می‌شود.
 
 ### مرجع API
-موفق: `{ ok:true, status:200, lang, request_id, data }`.
-خطا: `{ ok:false, status, lang, request_id, error:{ code, message } }`.
-`request_id` در هدر `X-Request-Id` هم برمی‌گردد.
+موفق:
+```json
+{ "ok": true, "status": 200, "lang": "en", "request_id": "...", "data": {} }
+```
+خطا:
+```json
+{ "ok": false, "status": 400, "lang": "en", "request_id": "...",
+  "error": { "code": "E_INVALID_URL", "message": "..." } }
+```
 
-| متد | مسیر | توضیح |
+شکل `data` در resolve:
+```json
+{
+  "type": "video | image | album",
+  "author": { "username": "...", "full_name": "...", "avatar": "https://..." },
+  "caption": "...",
+  "thumbnail": "https://...",
+  "duration": 12.5,
+  "items": [
+    { "type": "video", "index": 0, "thumbnail": "https://...",
+      "variants": [
+        { "url": "https://...", "quality": "1080x1920", "width": 1080,
+          "height": 1920, "bitrate": 2000000, "size": 123456,
+          "mime": "video/mp4", "filename": "author_shortcode.mp4",
+          "has_audio": null }
+      ] }
+  ],
+  "source_url": "https://www.instagram.com/reel/.../",
+  "shortcode": "...",
+  "provider": "catplus.ir",
+  "variants_count": 1
+}
+```
+`has_audio` اگر upstream نگوید `null` است و هرگز حدس زده نمی‌شود. پسوند فایل
+همیشه از MIME نهایی گرفته می‌شود.
+
+| پارامتر | مربوط به | توضیح |
 |---|---|---|
-| GET | `/api/v1/resolve?url=&lang=` | متادیتا + لیست کیفیت‌ها |
-| GET | `/api/v1/download?url=&quality=&index=&inline=&lang=` | دانلود/پخش استریمی |
-| GET | `/api/v1/thumbnail?url=&lang=` | پروکسی تصویر بندانگشتی |
-| GET | `/health?deep=1` | وضعیت سرویس/providerها/محدودیت‌ها |
-| GET | `/openapi.json` | سند OpenAPI 3 |
-| GET | `/api/v1/admin/keys` | فهرست کلیدها (فقط label) |
-| POST | `/api/v1/admin/keys` | ساخت/به‌روزرسانی کلید (`{key,label?,limit_per_minute?}`) |
-| DELETE | `/api/v1/admin/keys` | غیرفعال‌کردن کلید (`{key}`) |
+| `url` | resolve/download/thumbnail | لینک اینستاگرام یا URL مستقیم CDN برای تامنیل |
+| `index` | download | عدد صحیح نامنفی، پیش‌فرض `0` |
+| `quality` | download | برچسب دقیق از `variants[].quality`؛ پیش‌فرض `best` (اولین) |
+| `inline` | download | `1` یعنی `Content-Disposition: inline` |
+| `lang` | همه | `en` (پیش‌فرض) یا `fa` |
+| `deep` | health | `1` همهٔ providerها را بررسی می‌کند (محدودیت نرخ دارد) |
 
-درخواست ادمین با `Authorization: Bearer <ADMIN_TOKEN>`.
-فقط هش هر API Key ذخیره می‌شود و کلید غیرفعال هرگز دوباره فعال نمی‌شود.
+نگاشت وضعیت: `E_INVALID_URL`/`E_INVALID_REQUEST`/`E_BAD_QUALITY`/`E_BAD_INDEX`/
+`E_NOT_ALLOWED_HOST` → ۴۰۰، `E_UNAUTHORIZED` → ۴۰۱، `E_NOT_FOUND`/
+`E_NO_VARIANTS`/`E_PRIVATE_OR_NOT_FOUND` → ۴۰۴، `E_METHOD` → ۴۰۵، `E_TOO_LARGE`
+→ ۴۱۳، `E_NOT_ALLOWED_TYPE` → ۴۱۵، `E_RATE_LIMIT` → ۴۲۹، `E_UPSTREAM_FAILED`/
+`E_UPSTREAM_UNAVAILABLE` → ۵۰۲، `E_UPSTREAM_TIMEOUT` → ۵۰۴، `E_INTERNAL` → ۵۰۰.
 
-کدهای خطا: `E_INVALID_URL`, `E_INVALID_REQUEST`, `E_PRIVATE_OR_NOT_FOUND`,
-`E_UPSTREAM_FAILED`, `E_UPSTREAM_UNAVAILABLE`, `E_RATE_LIMIT`, `E_TOO_LARGE`,
-`E_NOT_ALLOWED_HOST`, `E_NOT_ALLOWED_TYPE`, `E_BAD_QUALITY`, `E_BAD_INDEX`,
-`E_NO_VARIANTS`, `E_METHOD`, `E_NOT_FOUND`, `E_UNAUTHORIZED`, `E_FORBIDDEN`,
-`E_KEY_DISABLED`, `E_KEY_EXISTS`, `E_INTERNAL`. همهٔ پاسخ‌ها `X-RateLimit-*`
-دارند و پاسخ‌های محدود `Retry-After` هم دارند.
+پاسخ‌های محدود `Retry-After` و `X-RateLimit-*` دارند. شمارش محدودیت تقریبی و
+مبتنی بر KV است (eventually consistent) و شمارندهٔ دقیق جهانی نیست.
+
+**نمونه‌ها**
+
+```bash
+# resolve
+curl "https://<worker>/api/v1/resolve?url=https%3A%2F%2Fwww.instagram.com%2Freel%2FABC123%2F"
+
+# دانلود بهترین کیفیت با نام فایل پایدار
+curl -OJ "https://<worker>/api/v1/download?url=https%3A%2F%2Fwww.instagram.com%2Freel%2FABC123%2F"
+
+# وقتی API_KEYS تنظیم شده است
+curl -H "Authorization: Bearer $API_KEY" \
+  "https://<worker>/api/v1/resolve?url=https%3A%2F%2Fwww.instagram.com%2Freel%2FABC123%2F"
+```
+
+```python
+import requests
+
+r = requests.get(
+    "https://<worker>/api/v1/resolve",
+    params={"url": "https://www.instagram.com/reel/ABC123/"},
+    headers={"Authorization": "Bearer <key>"},  # فقط وقتی API_KEYS تنظیم شده
+    timeout=30,
+)
+r.raise_for_status()
+print(r.json()["data"]["items"])
+```
+
+```javascript
+const u = new URL("https://<worker>/api/v1/resolve");
+u.searchParams.set("url", "https://www.instagram.com/reel/ABC123/");
+const res = await fetch(u, { headers: { authorization: `Bearer ${key}` } }); // key اختیاری
+console.log((await res.json()).data);
+```
 
 ### توسعه
 ```bash
 npm install --no-audit --no-fund
-npm run check        # بررسی سینتکس + ۱۱۱ تست mock (بدون شبکهٔ واقعی)
+npm run check        # بررسی سینتکس + ۹۷ تست mock (بدون شبکهٔ واقعی)
 npm test             # فقط تست‌ها
 npm run bundle       # dist/worker.js تک‌فایلی
 npm run dev          # wrangler dev
@@ -317,27 +450,28 @@ npm run deploy       # wrangler deploy
 npm run secret-scan  # جلوگیری از push شدن توکن
 ```
 
-تست‌ها `fetch` را mock می‌کنند و پارس URL، نرمال‌سازی، fallback/breaker،
-قواعد SSRF و redirect، سقف استریم، KV/D1، هم‌ترازی migration با schema،
-کامل‌بودن i18n، HTML/CSP و مسیرهای HTTP را پوشش می‌دهند.
+تست‌ها `fetch` را mock می‌کنند و پارس URL، نرمال‌سازی، timeout/fallback/breaker،
+قواعد SSRF و redirect، سقف استریم و قواعد MIME، rate limit/کش/ETag در KV،
+کورس، احراز هویت و مسیرهای HTTP را پوشش می‌دهند.
 
 ### عیب‌یابی
-- **۴۲۹** — منتظر `Retry-After` بمانید یا برای سقف بالاتر API Key بسازید.
-- **E_UPSTREAM_FAILED** — همهٔ providerها خطا دادند؛ `UPSTREAM_URLS` و
-  `/health?deep=1` را بررسی کنید.
-- **E_NOT_ALLOWED_HOST** — CDN در allowlist نیست؛ `CDN_ALLOWLIST` را گسترش دهید.
-- **صفحهٔ خالی/عجیب** — با `/?debug=1` پنل خطا را ببینید؛ صفحه سمت سرور رندر
-  می‌شود و بدون JS هم دیده می‌شود.
-- **نبود D1/KV** — سرویس degrade می‌کند: کش/محدودیت نرخ یا آمار رد می‌شود ولی
-  درخواست‌ها کار می‌کنند.
+- **۴۰۱** — `API_KEYS` تنظیم شده و درخواست `Bearer`/`x-api-key` معتبر ندارد.
+- **۴۲۹** — منتظر `Retry-After` بمانید؛ محدودیت بر اساس IP یا API key است.
+- **E_UPSTREAM_FAILED** — همهٔ providerها خطا دادند یا پاسخ بی‌فایده برگرداندند؛
+  `UPSTREAM_URLS` و `/health?deep=1` را بررسی کنید.
+- **E_UPSTREAM_TIMEOUT** — timeout منبع؛ `UPSTREAM_TIMEOUT_MS` یا provider را
+  بررسی کنید.
+- **E_NOT_ALLOWED_HOST** — میزبان رسانه در `CDN_ALLOWLIST` نیست.
+- **نبود KV** — سرویس همچنان کار می‌کند؛ کش و محدودیت نرخ degrade می‌شوند
+  (`/health` مقدار `storage.kv: false` را نشان می‌دهد).
 
 ### ملاحظات حقوقی
-فقط استفادهٔ شخصی با محتوای عمومی. نام صاحب محتوا و لینک اصلی همیشه نمایش داده
-می‌شود؛ حق نشر را رعایت کنید. برای DMCA/Takedown از `CONTACT_URL` استفاده کنید.
-این پروژه مستقل است و به اینستاگرام/متا وابسته نیست.
+فقط استفادهٔ شخصی با محتوای عمومی. همیشه نام صاحب محتوا و لینک اصلی را ذکر
+کنید؛ حق نشر و قوانین اینستاگرام را رعایت کنید. برای درخواست حذف محتوا یک Issue
+در همین مخزن باز کنید. این پروژه مستقل است و به اینستاگرام/متا وابسته نیست.
 
-**هشدار امنیتی:** هرگز توکن را در چت یا اسکرین‌شات نگذارید. اگر گذاشتید فوراً
-Revoke/Roll کنید (Cloudflare → My Profile → API Tokens) و GitHub Secret /
-`wrangler secret put` را به‌روز کنید.
+**هشدار امنیتی:** هرگز توکن را در چت یا اسکرین‌شات نگذارید. اگر توکن API
+Cloudflare لو رفت، فوراً آن را Roll/Delete کنید (My Profile → API Tokens) و
+GitHub Secret یا `wrangler secret put` را به‌روز کنید.
 
 لایسنس MIT.

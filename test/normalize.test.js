@@ -168,3 +168,42 @@ test("a video URL is never promoted to the top-level thumbnail", () => {
   assert.equal(r.thumbnail, null);
 });
 
+
+test("null or non-object payloads and invalid context are rejected", () => {
+  assert.equal(normalizeUpstream([], ctx), null);
+  assert.equal(normalizeUpstream("x", ctx), null);
+  assert.equal(normalizeUpstream({ image: ["https://scontent.cdninstagram.com/a.jpg"] }, null), null);
+});
+
+test("sanitizeUrl strips tracking params from variant and thumbnail URLs", () => {
+  const r = normalizeUpstream(
+    {
+      video: [
+        {
+          video: "https://scontent.cdninstagram.com/v.mp4?igsh=abc&utm_source=x",
+          thumbnail: "https://scontent.cdninstagram.com/t.jpg?igsh=abc",
+        },
+      ],
+    },
+    ctx,
+    "p",
+  );
+  assert.equal(r.items[0].variants[0].url, "https://scontent.cdninstagram.com/v.mp4");
+  assert.equal(r.thumbnail, "https://scontent.cdninstagram.com/t.jpg");
+});
+
+test("an image keeps an image MIME even if upstream claims video", () => {
+  const r = normalizeUpstream(
+    { image: [{ url: "https://scontent.cdninstagram.com/a.jpg", mime: "video/mp4" }] },
+    ctx,
+    "p",
+  );
+  const v = r.items[0].variants[0];
+  assert.equal(v.mime, "image/jpeg");
+  assert.match(v.filename, /\.jpg$/);
+});
+
+test("a single resolved item is typed by its own media kind", () => {
+  const r = normalizeUpstream({ type: "video", image: ["https://scontent.cdninstagram.com/a.jpg"] }, ctx, "p");
+  assert.equal(r.type, "image");
+});

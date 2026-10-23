@@ -26,16 +26,18 @@ test("forgiving scheme-less input", () => {
   assert.equal(r.shortcode, "Ab1X");
 });
 
-test("strips tracking params from canonical", () => {
+test("strips tracking params from the returned URL", () => {
   const r = parseInstagramUrl("https://www.instagram.com/p/Ab1X/?igsh=xyz&utm_source=q");
   assert.equal(r.canonical, "https://www.instagram.com/p/Ab1X/");
+  assert.equal(r.url.search, "");
 });
 
 test("rejects non-instagram hosts", () => {
   for (const bad of [
-    "https://evil.com/p/Ab1/",
-    "https://instagram.com.evil.com/p/Ab1/",
-    "https://www.instagram.com.evil.com/p/Ab1/",
+    "https://evil.com/p/Ab12/",
+    "https://instagram.com.evil.com/p/Ab12/",
+    "https://www.instagram.com.evil.com/p/Ab12/",
+    "https://cdninstagram.com/p/Ab12/",
   ]) {
     assert.throws(() => parseInstagramUrl(bad), UrlError);
   }
@@ -43,16 +45,43 @@ test("rejects non-instagram hosts", () => {
 
 test("rejects http, ports and credentials", () => {
   assert.throws(() => parseInstagramUrl("http://www.instagram.com/p/Ab1X/"));
-  assert.throws(() => parseInstagramUrl("https://www.instagram.com:8443/p/Ab1/"));
+  assert.throws(() => parseInstagramUrl("https://www.instagram.com:8443/p/Ab12/"));
   assert.throws(() => parseInstagramUrl("https://user:pass@www.instagram.com/p/Ab1X/"));
 });
 
 test("rejects wrong paths and bad shortcodes", () => {
-  assert.throws(() => parseInstagramUrl("https://www.instagram.com/explore/"));
-  assert.throws(() => parseInstagramUrl("https://www.instagram.com/p/"));
-  assert.throws(() => parseInstagramUrl("https://www.instagram.com/p/@@@/"));
-  assert.throws(() => parseInstagramUrl(""));
-  assert.throws(() => parseInstagramUrl(null));
+  for (const bad of [
+    "https://www.instagram.com/explore/",
+    "https://www.instagram.com/p/",
+    "https://www.instagram.com/p/@@@/",
+    "https://www.instagram.com/p/Ab12/comments/",
+    "https://www.instagram.com/p/Ab12/extra",
+    "https://www.instagram.com/reel/abc", // too short
+    "",
+    null,
+    undefined,
+    42,
+  ]) {
+    assert.throws(() => parseInstagramUrl(bad), UrlError, String(bad));
+  }
+});
+
+test("rejects non-media paths such as /reels/audio", () => {
+  for (const bad of [
+    "https://www.instagram.com/reels/audio/",
+    "https://www.instagram.com/p/audio/",
+    "https://www.instagram.com/tv/explore/",
+    "https://www.instagram.com/reel/stories/",
+  ]) {
+    assert.throws(() => parseInstagramUrl(bad), UrlError, bad);
+  }
+});
+
+test("shortcodes must be 4..32 characters", () => {
+  assert.equal(parseInstagramUrl("https://www.instagram.com/p/Ab12/").shortcode, "Ab12");
+  assert.equal(parseInstagramUrl(`https://www.instagram.com/p/${"a".repeat(32)}/`).shortcode.length, 32);
+  assert.throws(() => parseInstagramUrl("https://www.instagram.com/p/Ab1/"), UrlError);
+  assert.throws(() => parseInstagramUrl(`https://www.instagram.com/p/${"a".repeat(33)}/`), UrlError);
 });
 
 test("buildFilename produces author_shortcode.ext", () => {

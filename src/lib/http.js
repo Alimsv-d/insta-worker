@@ -1,13 +1,13 @@
-// Standard JSON envelope, error codes, CORS and cache headers.
+// Standard JSON envelope, stable error codes, configurable CORS and cache
+// headers.
 //
-// Header rules enforced here:
-//   * a page that carries a per-request nonce is NEVER publicly cached
-//     (`private, no-store`);
-//   * the CSP has no `unsafe-inline`: the inline <style> and the inline
-//     <script> are bound to per-request nonces;
-//   * rate-limit headers never travel with a publicly cacheable response;
-//   * the fixed envelope fields (ok / status / lang / error / data) always win
-//     over caller supplied extras.
+// Rules enforced here:
+//   * every JSON error carries `request_id`, `lang` and a stable `error.code`;
+//   * resolve/error responses are `private, no-store` so a shared cache can
+//     never replay a rate-limited or signed response;
+//   * CORS is controlled by ALLOWED_ORIGINS (default `*`); when an explicit
+//     list is configured only a matching Origin is echoed back;
+//   * `X-Content-Type-Options: nosniff` is always present.
 
 import { t } from "./i18n.js";
 
@@ -16,98 +16,86 @@ export const ERROR_STATUS = {
   E_INVALID_REQUEST: 400,
   E_BAD_QUALITY: 400,
   E_BAD_INDEX: 400,
+  E_NOT_ALLOWED_HOST: 400,
+  E_NOT_ALLOWED_TYPE: 415,
   E_METHOD: 405,
   E_UNAUTHORIZED: 401,
-  E_FORBIDDEN: 403,
   E_NOT_FOUND: 404,
-  E_NOT_ALLOWED_HOST: 400,
-  E_NOT_ALLOWED_TYPE: 400,
+  E_NO_VARIANTS: 404,
+  E_PRIVATE_OR_NOT_FOUND: 404,
   E_RATE_LIMIT: 429,
   E_TOO_LARGE: 413,
-  E_PRIVATE_OR_NOT_FOUND: 404,
   E_UPSTREAM_FAILED: 502,
   E_UPSTREAM_UNAVAILABLE: 502,
-  E_NO_VARIANTS: 404,
-  E_KEY_DISABLED: 409,
-  E_KEY_EXISTS: 409,
+  E_UPSTREAM_TIMEOUT: 504,
   E_INTERNAL: 500,
 };
 
-export function corsHeaders(extra = {}) {
-  return {
-    "access-control-allow-origin": "*",
-    "access-control-allow-methods": "GET,HEAD,OPTIONS",
-    "access-control-allow-headers": "Content-Type, Authorization, X-Requested-With, X-API-Key, Range, If-None-Match",
+function stripTrailingSlash(value) {
+  return String(value || "").replace(/\/+$/, "");
+}
+
+/**
+ * `ALLOWED_ORIGINS` is either `*` (default) or a comma-separated list of
+ * origins. Returns `"*"` or an array of normalised origins.
+ */
+export function parseAllowedOrigins(env) {
+  const raw = env && env.ALLOWED_ORIGINS;
+  const value = typeof raw === "string" && raw.trim() ? raw.trim() : "*";
+  if (value === "*") return "*";
+  const list = value
+    .split(",")
+    .map((s) => stripTrailingSlash(s.trim()))
+    .filter(Boolean);
+  return list.length ? list : "*";
+}
+
+export function corsHeaders(request, env) {
+  const allowed = parseAllowedOrigins(env);
+  const origin = request ? request.headers.get("origin") : null;
+  const headers = {
+    "access-control-allow-methods": "GET, HEAD, OPTIONS",
+    "access-control-allow-headers": "Content-Type, Authorization, X-API-Key, X-Requested-With, Range, If-None-Match",
     "access-control-max-age": "86400",
     "access-control-expose-headers":
       "X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset, Retry-After, ETag, X-Request-Id, Content-Disposition, Content-Range, Accept-Ranges",
-    ...extra,
   };
+  if (allowed === "*") {
+    headers["access-control-allow-origin"] = "*";
+  } else {
+    headers.vary = "Origin";
+    if (origin && allowed.includes(stripTrailingSlash(origin))) {
+      headers["access-control-allow-origin"] = origin;
+    }
+  }
+  return headers;
 }
 
-export function baseHeaders(extra = {}) {
+export function baseHeaders(request, env, extra = {}) {
   return {
     "x-content-type-options": "nosniff",
     "referrer-policy": "no-referrer",
     "permissions-policy": "geolocation=(), microphone=(), camera=()",
-    ...corsHeaders(extra),
-  };
-}
-
-const SECURITY_HEADERS = {
-  "x-content-type-options": "nosniff",
-  "x-frame-options": "DENY",
-  "referrer-policy": "no-referrer",
-  "permissions-policy": "geolocation=(), microphone=(), camera=()",
-  "strict-transport-security": "max-age=31536000; includeSubDomains",
-};
-
-/**
- * Build a Content-Security-Policy without `unsafe-inline`.
- *
- * `scriptNonce` binds the inline script, `styleNonce` binds the inline
- * stylesheet. When a nonce is missing the directive falls back to 'self'
- * (the bundled assets), never to 'unsafe-inline'.
- */
-export function buildCsp(scriptNonce, styleNonce) {
-  const scriptSrc = scriptNonce ? `'nonce-${scriptNonce}'` : "'self'";
-  const styleSrc = styleNonce ? `'nonce-${styleNonce}'` : "'self'";
-  return [
-    "default-src 'self'",
-    `script-src ${scriptSrc}`,
-    `style-src ${styleSrc}`,
-    "img-src 'self' data: blob: https://*.cdninstagram.com https://*.fbcdn.net https://*.instagram.com https://*.facebook.com",
-    "media-src 'self' blob: https://*.cdninstagram.com https://*.fbcdn.net https://*.instagram.com https://*.facebook.com",
-    // The webfont is loaded from a pinned CDN version with an SRI hash.
-    "font-src 'self' https://cdn.jsdelivr.net",
-    "connect-src 'self'",
-    "frame-src 'none'",
-    "object-src 'none'",
-    "base-uri 'none'",
-    "form-action 'self'",
-    "frame-ancestors 'none'",
-  ].join("; ");
-}
-
-export function htmlHeaders(scriptNonce, styleNonce, extra = {}) {
-  return {
-    "content-type": "text/html; charset=utf-8",
-    ...SECURITY_HEADERS,
-    "content-security-policy": buildCsp(scriptNonce, styleNonce),
-    // A nonce-carrying document must never end up in a shared cache.
-    "cache-control": "private, no-store",
+    ...corsHeaders(request, env),
     ...extra,
   };
 }
 
-/**
- * Error envelope. `headers` are response headers, `body` adds fields to the
- * envelope — the fixed fields always win.
- */
+/** Add CORS (and the shared security headers) to a streamed/binary response. */
+export function applyCors(headers, request, env) {
+  for (const [key, value] of Object.entries(corsHeaders(request, env))) {
+    headers.set(key, value);
+  }
+  return headers;
+}
+
 export function jsonError(code, lang, options = {}) {
-  const { headers = {}, body = {} } = options || {};
+  const { headers = {}, body = {}, request, env } = options || {};
   const status = ERROR_STATUS[code] || 500;
   const headersOut = { ...headers };
+  if (!headersOut["x-request-id"] && body && body.request_id) {
+    headersOut["x-request-id"] = body.request_id;
+  }
   if (status === 401 && !headersOut["www-authenticate"]) {
     headersOut["www-authenticate"] = 'Bearer realm="insta-worker"';
   }
@@ -124,22 +112,23 @@ export function jsonError(code, lang, options = {}) {
     },
     status,
     lang,
-    headersOut,
+    { request, env, headers: headersOut },
   );
 }
 
-/** Success envelope. */
 export function jsonOk(data, lang, options = {}) {
-  const { headers = {}, body = {} } = options || {};
-  return jsonResponse({ ...body, ok: true, status: 200, lang, data }, 200, lang, headers);
+  const { headers = {}, body = {}, request, env } = options || {};
+  return jsonResponse({ ...body, ok: true, status: 200, lang, data }, 200, lang, { request, env, headers });
 }
 
-export function jsonResponse(body, status, lang, headers = {}) {
+export function jsonResponse(body, status, lang, options = {}) {
+  const { request, env, headers = {} } = options || {};
   const merged = { ...headers };
-  const h = new Headers(baseHeaders(merged));
+  const h = new Headers(baseHeaders(request, env, merged));
   h.set("content-type", "application/json; charset=utf-8");
-  if (!("cache-control" in merged)) h.set("cache-control", "no-store");
-  return new Response(JSON.stringify(body), { status, headers: h });
+  if (!h.has("cache-control")) h.set("cache-control", "private, no-store");
+  const isHead = request && String(request.method || "").toUpperCase() === "HEAD";
+  return new Response(isHead ? null : JSON.stringify(body), { status, headers: h });
 }
 
 export function newRequestId() {
@@ -152,18 +141,4 @@ export function newRequestId() {
 
 export function withRequestId(body, requestId) {
   return { ...body, request_id: requestId };
-}
-
-/**
- * A cryptographically random nonce for CSP. Falls back to `crypto.getRandomValues`
- * when `crypto.randomUUID` is unavailable.
- */
-export function newNonce() {
-  try {
-    const bytes = new Uint8Array(16);
-    crypto.getRandomValues(bytes);
-    return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
-  } catch {
-    return newRequestId().replace(/-/g, "");
-  }
 }

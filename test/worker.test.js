@@ -1,7 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import worker from "../src/worker.js";
-import { checkRateLimit } from "../src/lib/storage.js";
 import { resetProviderState } from "../src/lib/providers.js";
 
 function kvStub() {
@@ -16,482 +15,383 @@ function kvStub() {
   };
 }
 
-function d1Stub(rows = {}) {
-  // Minimal D1 stub: prepare(...) and prepare(...).bind(...) both expose
-  // run()/first()/all() so ensureSchema() and the admin queries work.
-  return {
-    prepare(sql) {
-      const api = {
-        async run() {
-          return { success: true, meta: { changes: 1 } };
-        },
-        async first() {
-          if (/FROM api_keys/i.test(sql)) return rows.apiKey || null;
-          return null;
-        },
-        async all() {
-          return { results: rows.apiKeys || [] };
-        },
-        bind() {
-          return api;
-        },
-      };
-      return api;
-    },
-  };
-}
-
 const env = {
   KV: kvStub(),
   UPSTREAM_URLS: "https://catplus.ir/api/insta",
   RATE_LIMIT_PER_MINUTE: "1000",
   RATE_LIMIT_DOWNLOAD_PER_MINUTE: "1000",
+  RATE_LIMIT_THUMBNAIL_PER_MINUTE: "1000",
+  RATE_LIMIT_HEALTH_PER_MINUTE: "1000",
   MAX_DOWNLOAD_MB: "80",
   CDN_ALLOWLIST: "*.cdninstagram.com,*.fbcdn.net",
-  DEFAULT_LANG: "fa",
-  CONTACT_URL: "https://example.com/contact",
+  ALLOWED_ORIGINS: "*",
 };
 
 const ctx = {};
-const call = (path, init) => worker.fetch(new Request("https://worker.example" + path, init), env, ctx);
+const call = (path, init, e = env) => worker.fetch(new Request("https://worker.example" + path, init), e, ctx);
 
-test("GET /health returns ok JSON with storage info", async () => {
+function upstreamJson(payload) {
+  return new Response(JSON.stringify(payload), { headers: { "content-type": "application/json" } });
+}
+
+function mockUpstreamAndCdn(media = "BINARY", mediaHeaders = {}) {
+  return async (u) => {
+    if (String(u).includes("/api/insta")) {
+      return upstreamJson({ video: [{ video: "https://scontent.cdninstagram.com/v.mp4" }] });
+    }
+    return new Response(media, {
+      status: 200,
+      headers: { "content-type": "video/mp4", "content-length": "6", "accept-ranges": "bytes", ...mediaHeaders },
+    });
+  };
+}
+
+test("GET / returns a short JSON service summary", async () => {
+  const res = await call("/");
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.ok, true);
+  assert.equal(body.data.name, "insta-worker");
+  assert.equal(body.data.auth_required, false);
+  assert.ok(body.data.endpoints.some((e) => e.path === "/api/v1/resolve"));
+  assert.equal(body.data.openapi, "/openapi.json");
+  assert.equal(res.headers.get("cache-control"), "private, no-store");
+  assert.equal(res.headers.get("x-content-type-options"), "nosniff");
+});
+
+test("GET /health reports KV-only storage and no mandatory secrets", async () => {
   const res = await call("/health");
   assert.equal(res.status, 200);
   const body = await res.json();
   assert.equal(body.ok, true);
-  assert.equal(body.data.storage.kv, true);
-  assert.equal(body.data.storage.d1, false);
-  assert.equal(body.request_id !== undefined, true);
+  assert.deepEqual(body.data.storage, { kv: true });
+  assert.equal(body.data.auth_required, false);
+  assert.equal(body.data.limits.resolve, 1000);
+  assert.equal(body.data.max_download_mb, 80);
+  assert.equal(Array.isArray(body.data.providers), true);
+  assert.equal(body.data.provider_live, undefined);
 });
 
-test("GET /openapi.json serves a spec", async () => {
+test("GET /openapi.json serves the spec with a public cache", async () => {
   const res = await call("/openapi.json");
   assert.equal(res.status, 200);
+  assert.equal(res.headers.get("cache-control"), "public, max-age=3600");
   const body = await res.json();
-  assert.equal(body.ok, true);
-  const spec = body.data;
-  assert.equal(spec.openapi, "3.0.3");
-  assert.ok(spec.paths["/api/v1/resolve"]);
+  assert.equal(body.data.openapi, "3.0.3");
+  assert.ok(body.data.paths["/api/v1/download"]);
 });
 
-test("OPTIONS returns CORS preflight", async () => {
+test("OPTIONS returns a CORS preflight", async () => {
   const res = await call("/api/v1/resolve", { method: "OPTIONS" });
   assert.equal(res.status, 204);
   assert.equal(res.headers.get("access-control-allow-origin"), "*");
+  assert.match(res.headers.get("access-control-allow-methods") || "", /GET/);
 });
 
-test("resolve rejects invalid URL with E_INVALID_URL and error envelope", async () => {
-  const res = await call("/api/v1/resolve?url=https://evil.com/p/x/");
+test("an explicit ALLOWED_ORIGINS list echoes only matching origins", async () => {
+  const e = { ...env, KV: kvStub(), ALLOWED_ORIGINS: "https://app.example, https://second.example/" };
+  const ok = await call("/health", { headers: { origin: "https://app.example" } }, e);
+  assert.equal(ok.headers.get("access-control-allow-origin"), "https://app.example");
+  assert.equal(ok.headers.get("vary"), "Origin");
+
+  const no = await call("/health", { headers: { origin: "https://evil.example" } }, e);
+  assert.equal(no.headers.get("access-control-allow-origin"), null);
+});
+
+test("resolve rejects an invalid URL with English by default", async () => {
+  const res = await call("/api/v1/resolve?url=" + encodeURIComponent("https://evil.com/p/Ab12/"));
   assert.equal(res.status, 400);
   const body = await res.json();
   assert.equal(body.ok, false);
   assert.equal(body.error.code, "E_INVALID_URL");
-  assert.equal(body.lang, "fa");
+  assert.equal(body.lang, "en");
+  assert.match(body.error.message, /Invalid link/);
   assert.ok(body.request_id);
+});
+
+test("resolve honours ?lang=fa for API error text", async () => {
+  const res = await call("/api/v1/resolve?lang=fa&url=" + encodeURIComponent("https://evil.com/p/Ab12/"));
+  const body = await res.json();
+  assert.equal(body.lang, "fa");
   assert.match(body.error.message, /لینک/);
 });
 
-test("resolve honours lang=en", async () => {
-  const res = await call("/api/v1/resolve?url=https://evil.com/p/x/&lang=en");
-  const body = await res.json();
-  assert.equal(body.lang, "en");
-  assert.match(body.error.message, /Invalid link/);
+test("unknown routes return E_NOT_FOUND; non-GET returns E_METHOD", async () => {
+  const api = await call("/api/v1/nope");
+  assert.equal(api.status, 404);
+  const apiBody = await api.json();
+  assert.equal(apiBody.error.code, "E_NOT_FOUND");
+  assert.equal(api.headers.get("x-request-id"), apiBody.request_id);
+
+  const root = await call("/nope");
+  assert.equal(root.status, 404);
+
+  const post = await call("/api/v1/resolve", { method: "POST" });
+  assert.equal(post.status, 405);
+  assert.equal(post.headers.get("allow"), "GET, HEAD, OPTIONS");
+  assert.equal((await post.json()).error.code, "E_METHOD");
 });
 
-test("unknown API route returns E_NOT_FOUND", async () => {
-  const res = await call("/api/v1/nope");
-  assert.equal(res.status, 404);
-  const body = await res.json();
-  assert.equal(body.error.code, "E_NOT_FOUND");
+test("download without url and thumbnail with a bad host are rejected", async () => {
+  const noUrl = await call("/api/v1/download");
+  assert.equal(noUrl.status, 400);
+  assert.equal((await noUrl.json()).error.code, "E_INVALID_URL");
+
+  const badHost = await call("/api/v1/thumbnail?url=" + encodeURIComponent("https://evil.com/a.jpg"));
+  assert.equal(badHost.status, 400);
+  assert.equal((await badHost.json()).error.code, "E_NOT_ALLOWED_HOST");
 });
 
-test("POST to API returns E_METHOD", async () => {
-  const res = await call("/api/v1/resolve", { method: "POST" });
-  assert.equal(res.status, 405);
-  assert.equal((await res.json()).error.code, "E_METHOD");
-});
-
-test("download without url returns E_INVALID_URL", async () => {
-  const res = await call("/api/v1/download");
-  assert.equal(res.status, 400);
-  assert.equal((await res.json()).error.code, "E_INVALID_URL");
-});
-
-test("thumbnail rejects disallowed host", async () => {
-  const res = await call("/api/v1/thumbnail?url=" + encodeURIComponent("https://evil.com/a.jpg"));
-  assert.equal(res.status, 400);
-  assert.equal((await res.json()).error.code, "E_NOT_ALLOWED_HOST");
-});
-
-test("rate limit returns 429 with Retry-After", async () => {
+test("rate limit returns 429 with Retry-After and CORS", async () => {
   const tightEnv = { ...env, KV: kvStub(), RATE_LIMIT_PER_MINUTE: "1" };
-  const path = "/api/v1/resolve?url=" + encodeURIComponent("https://www.instagram.com/reel/RL11/");
-  const origFetch = globalThis.fetch;
-  globalThis.fetch = async () =>
-    new Response(JSON.stringify({ video: [{ video: "https://scontent.cdninstagram.com/v.mp4" }] }), {
-      headers: { "content-type": "application/json" },
-    });
+  const path = "/api/v1/resolve?url=" + encodeURIComponent("https://www.instagram.com/reel/Rate1/");
+  const init = { headers: { "cf-connecting-ip": "203.0.113.9" } };
+  const orig = globalThis.fetch;
+  globalThis.fetch = mockUpstreamAndCdn();
   try {
-    // first request consumes the single slot
-    await worker.fetch(new Request("https://worker.example" + path), tightEnv, ctx);
-    const res = await worker.fetch(new Request("https://worker.example" + path), tightEnv, ctx);
+    assert.equal((await call(path, init, tightEnv)).status, 200);
+    const res = await call(path, init, tightEnv);
     assert.equal(res.status, 429);
     assert.ok(Number(res.headers.get("retry-after")) >= 1);
+    assert.equal(res.headers.get("access-control-allow-origin"), "*");
     assert.equal((await res.json()).error.code, "E_RATE_LIMIT");
   } finally {
-    globalThis.fetch = origFetch;
+    globalThis.fetch = orig;
   }
 });
 
-test("admin endpoint requires ADMIN_TOKEN", async () => {
-  const res = await call("/api/v1/admin/keys", { method: "POST", body: "{}" });
-  assert.equal(res.status, 401);
-  assert.equal((await res.json()).error.code, "E_UNAUTHORIZED");
-});
-
-test("caching: second resolve hits KV cache", async () => {
+test("second resolve is served from KV (x-cache HIT)", async () => {
   resetProviderState();
-  const cacheEnv = { ...env, KV: kvStub(), CACHE_TTL_SECONDS: "300" };
+  const e = { ...env, KV: kvStub() };
   const url = "https://www.instagram.com/reel/Cache1/";
-  // Seed the KV cache directly to avoid a network call.
-  await checkRateLimit(cacheEnv, "seed", "x", 1); // ensure KV works
   const calls = [];
-  const origFetch = globalThis.fetch;
+  const orig = globalThis.fetch;
   globalThis.fetch = async (u) => {
     calls.push(String(u));
-    return new Response(JSON.stringify({ video: [{ video: "https://scontent.cdninstagram.com/v.mp4" }] }), {
-      headers: { "content-type": "application/json" },
-    });
+    return upstreamJson({ video: [{ video: "https://scontent.cdninstagram.com/v.mp4" }] });
   };
   try {
-    const r1 = await worker.fetch(new Request("https://worker.example/api/v1/resolve?url=" + encodeURIComponent(url)), cacheEnv, ctx);
+    const p = "/api/v1/resolve?url=" + encodeURIComponent(url);
+    const r1 = await call(p, undefined, e);
     assert.equal(r1.status, 200);
     assert.equal(r1.headers.get("x-cache"), "MISS");
-    const r2 = await worker.fetch(new Request("https://worker.example/api/v1/resolve?url=" + encodeURIComponent(url)), cacheEnv, ctx);
+    const r2 = await call(p, undefined, e);
     assert.equal(r2.status, 200);
     assert.equal(r2.headers.get("x-cache"), "HIT");
     assert.equal(calls.length, 1, "upstream should be called once");
   } finally {
-    globalThis.fetch = origFetch;
+    globalThis.fetch = orig;
   }
 });
 
-test("ETag round-trip returns 304", async () => {
+test("resolve carries a strong ETag and answers If-None-Match with 304", async () => {
   resetProviderState();
-  const e2 = { ...env, KV: kvStub() };
+  const e = { ...env, KV: kvStub() };
   const url = "https://www.instagram.com/reel/ETag1/";
-  const origFetch = globalThis.fetch;
-  globalThis.fetch = async () =>
-    new Response(JSON.stringify({ image: ["https://scontent.cdninstagram.com/a.jpg"] }), { headers: { "content-type": "application/json" } });
+  const orig = globalThis.fetch;
+  globalThis.fetch = async () => upstreamJson({ image: ["https://scontent.cdninstagram.com/a.jpg"] });
   try {
-    const r1 = await worker.fetch(new Request("https://worker.example/api/v1/resolve?url=" + encodeURIComponent(url)), e2, ctx);
+    const p = "/api/v1/resolve?url=" + encodeURIComponent(url);
+    const r1 = await call(p, undefined, e);
     const etag = r1.headers.get("etag");
-    assert.ok(etag);
-    const r2 = await worker.fetch(
-      new Request("https://worker.example/api/v1/resolve?url=" + encodeURIComponent(url), { headers: { "if-none-match": etag } }),
-      e2,
-      ctx,
-    );
+    assert.match(etag || "", /^"sha256-[0-9a-f]{64}"$/);
+    assert.equal(r1.headers.get("cache-control"), "private, no-store");
+    assert.match(r1.headers.get("x-ratelimit-limit") || "", /^\d+$/);
+
+    const r2 = await call(p, { headers: { "if-none-match": etag } }, e);
     assert.equal(r2.status, 304);
-    assert.equal(r2.headers.get("cache-control"), "private, no-store");
     assert.equal(r2.headers.get("etag"), etag);
-    assert.ok(r2.headers.get("x-ratelimit-limit"));
+    assert.equal(r2.headers.get("cache-control"), "private, no-store");
+    assert.equal(await r2.text(), "");
   } finally {
-    globalThis.fetch = origFetch;
+    globalThis.fetch = orig;
   }
 });
 
-test("download proxies via mocked CDN and sets Content-Disposition", async () => {
+test("download streams the CDN response with a safe attachment name and CORS", async () => {
   resetProviderState();
-  const e2 = { ...env, KV: kvStub() };
-  const url = "https://www.instagram.com/reel/DL11/";
-  const origFetch = globalThis.fetch;
-  globalThis.fetch = async (u) => {
-    const target = String(u);
-    if (target.includes("/api/insta")) {
-      return new Response(JSON.stringify({ video: [{ video: "https://scontent.cdninstagram.com/v.mp4" }] }), {
-        headers: { "content-type": "application/json" },
-      });
-    }
-    return new Response("BINARY", { status: 200, headers: { "content-type": "video/mp4", "content-length": "6", "accept-ranges": "bytes" } });
-  };
+  const e = { ...env, KV: kvStub() };
+  const orig = globalThis.fetch;
+  globalThis.fetch = mockUpstreamAndCdn();
   try {
-    const res = await worker.fetch(new Request("https://worker.example/api/v1/download?url=" + encodeURIComponent(url)), e2, ctx);
+    const res = await call("/api/v1/download?url=" + encodeURIComponent("https://www.instagram.com/reel/DL11/"), undefined, e);
     assert.equal(res.status, 200);
-    assert.match(res.headers.get("content-disposition") || "", /attachment; filename=/);
+    assert.match(res.headers.get("content-disposition") || "", /^attachment; filename="/);
+    assert.equal(res.headers.get("content-type"), "video/mp4");
+    assert.equal(res.headers.get("x-content-type-options"), "nosniff");
+    assert.equal(res.headers.get("access-control-allow-origin"), "*");
+    assert.equal(res.headers.get("cache-control"), "private, max-age=300");
     assert.equal(await res.text(), "BINARY");
   } finally {
-    globalThis.fetch = origFetch;
+    globalThis.fetch = orig;
   }
 });
 
 test("download passes E_PRIVATE_OR_NOT_FOUND through", async () => {
   resetProviderState();
-  const e2 = { ...env, KV: kvStub() };
-  const url = "https://www.instagram.com/reel/GONE1/";
-  const origFetch = globalThis.fetch;
-  globalThis.fetch = async () => new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+  const e = { ...env, KV: kvStub() };
+  const orig = globalThis.fetch;
+  globalThis.fetch = async () => upstreamJson({});
   try {
-    const res = await worker.fetch(new Request("https://worker.example/api/v1/download?url=" + encodeURIComponent(url)), e2, ctx);
+    const res = await call("/api/v1/download?url=" + encodeURIComponent("https://www.instagram.com/reel/GONE1/"), undefined, e);
     assert.equal(res.status, 404);
     assert.equal((await res.json()).error.code, "E_PRIVATE_OR_NOT_FOUND");
   } finally {
-    globalThis.fetch = origFetch;
+    globalThis.fetch = orig;
   }
 });
 
-test("download rejects unknown quality with E_BAD_QUALITY", async () => {
+test("download rejects an unknown quality, a bad index and an oversized file", async () => {
   resetProviderState();
-  const e2 = { ...env, KV: kvStub() };
-  const url = "https://www.instagram.com/reel/QQ11/";
-  const origFetch = globalThis.fetch;
-  globalThis.fetch = async () =>
-    new Response(JSON.stringify({ video: [{ video: "https://scontent.cdninstagram.com/v.mp4" }] }), {
-      headers: { "content-type": "application/json" },
-    });
+  const e = { ...env, KV: kvStub(), MAX_DOWNLOAD_MB: "1" };
+  const orig = globalThis.fetch;
+  globalThis.fetch = mockUpstreamAndCdn("x", { "content-length": String(50 * 1024 * 1024) });
   try {
-    const res = await worker.fetch(
-      new Request("https://worker.example/api/v1/download?url=" + encodeURIComponent(url) + "&quality=does-not-exist"),
-      e2,
-      ctx,
-    );
-    assert.equal(res.status, 400);
-    assert.equal((await res.json()).error.code, "E_BAD_QUALITY");
+    const base = "/api/v1/download?url=" + encodeURIComponent("https://www.instagram.com/reel/Qual1/");
+    const badQuality = await call(base + "&quality=nope", undefined, e);
+    assert.equal(badQuality.status, 400);
+    assert.equal((await badQuality.json()).error.code, "E_BAD_QUALITY");
+
+    const badIndex = await call(base + "&index=abc", undefined, e);
+    assert.equal(badIndex.status, 400);
+    assert.equal((await badIndex.json()).error.code, "E_BAD_INDEX");
+
+    const negIndex = await call(base + "&index=-1", undefined, e);
+    assert.equal(negIndex.status, 400);
+    assert.equal((await negIndex.json()).error.code, "E_BAD_INDEX");
+
+    const tooBig = await call(base, undefined, e);
+    assert.equal(tooBig.status, 413);
+    assert.equal((await tooBig.json()).error.code, "E_TOO_LARGE");
   } finally {
-    globalThis.fetch = origFetch;
+    globalThis.fetch = orig;
   }
 });
 
-test("download rejects bad index with E_BAD_INDEX", async () => {
+test("download sends Content-Disposition: inline when inline=1", async () => {
   resetProviderState();
-  const e2 = { ...env, KV: kvStub() };
-  const url = "https://www.instagram.com/reel/II11/";
-  const origFetch = globalThis.fetch;
-  globalThis.fetch = async () =>
-    new Response(JSON.stringify({ video: [{ video: "https://scontent.cdninstagram.com/v.mp4" }] }), {
-      headers: { "content-type": "application/json" },
-    });
+  const e = { ...env, KV: kvStub() };
+  const orig = globalThis.fetch;
+  globalThis.fetch = mockUpstreamAndCdn();
   try {
-    const res = await worker.fetch(
-      new Request("https://worker.example/api/v1/download?url=" + encodeURIComponent(url) + "&index=99"),
-      e2,
-      ctx,
-    );
-    assert.equal(res.status, 400);
-    assert.equal((await res.json()).error.code, "E_BAD_INDEX");
-  } finally {
-    globalThis.fetch = origFetch;
-  }
-});
-
-test("download rejects oversized declared file with E_TOO_LARGE", async () => {
-  resetProviderState();
-  const e2 = { ...env, KV: kvStub(), MAX_DOWNLOAD_MB: "1" };
-  const url = "https://www.instagram.com/reel/BIG1/";
-  const origFetch = globalThis.fetch;
-  globalThis.fetch = async (u) => {
-    if (String(u).includes("/api/insta")) {
-      return new Response(JSON.stringify({ video: [{ video: "https://scontent.cdninstagram.com/v.mp4" }] }), {
-        headers: { "content-type": "application/json" },
-      });
-    }
-    return new Response("x", { status: 200, headers: { "content-type": "video/mp4", "content-length": String(50 * 1024 * 1024) } });
-  };
-  try {
-    const res = await worker.fetch(new Request("https://worker.example/api/v1/download?url=" + encodeURIComponent(url)), e2, ctx);
-    assert.equal(res.status, 413);
-    assert.equal((await res.json()).error.code, "E_TOO_LARGE");
-  } finally {
-    globalThis.fetch = origFetch;
-  }
-});
-
-test("admin creates an api key when ADMIN_TOKEN matches", async () => {
-  const adminEnv = { ...env, KV: kvStub(), ADMIN_TOKEN: "s3cret-token", DB: d1Stub() };
-  const res = await worker.fetch(
-    new Request("https://worker.example/api/v1/admin/keys", {
-      method: "POST",
-      headers: { authorization: "Bearer s3cret-token", "content-type": "application/json" },
-      body: JSON.stringify({ key: "user-key-1", label: "test" }),
-    }),
-    adminEnv,
-    ctx,
-  );
-  assert.equal(res.status, 200);
-  const body = await res.json();
-  assert.equal(body.ok, true);
-  assert.equal(body.data.created, true);
-  assert.ok(body.request_id);
-});
-
-test("deep health check reports provider reachability", async () => {
-  resetProviderState();
-  const e2 = { ...env, KV: kvStub() };
-  const origFetch = globalThis.fetch;
-  globalThis.fetch = async () => new Response("[]", { status: 200 });
-  try {
-    const res = await worker.fetch(new Request("https://worker.example/health?deep=1"), e2, ctx);
-    assert.equal(res.status, 200);
-    const body = await res.json();
-    assert.ok(Array.isArray(body.data.provider_live));
-    assert.equal(body.data.provider_live[0].reachable, true);
-  } finally {
-    globalThis.fetch = origFetch;
-  }
-});
-
-test("resolve is private, no-store and carries a strong ETag", async () => {
-  resetProviderState();
-  const e2 = { ...env, KV: kvStub() };
-  const url = "https://www.instagram.com/reel/Priv1/";
-  const origFetch = globalThis.fetch;
-  globalThis.fetch = async () =>
-    new Response(JSON.stringify({ video: [{ video: "https://scontent.cdninstagram.com/v.mp4" }] }), {
-      headers: { "content-type": "application/json" },
-    });
-  try {
-    const res = await worker.fetch(new Request("https://worker.example/api/v1/resolve?url=" + encodeURIComponent(url)), e2, ctx);
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get("cache-control"), "private, no-store");
-    assert.match(res.headers.get("etag") || "", /^"sha256-[0-9a-f]{64}"$/);
-    assert.equal(res.headers.get("x-ratelimit-limit"), "1000");
-    assert.equal(res.headers.get("x-cache"), "MISS");
-  } finally {
-    globalThis.fetch = origFetch;
-  }
-});
-
-test("download sends the requested inline disposition when inline=1", async () => {
-  resetProviderState();
-  const e2 = { ...env, KV: kvStub() };
-  const url = "https://www.instagram.com/reel/Inline1/";
-  const origFetch = globalThis.fetch;
-  globalThis.fetch = async (u) => {
-    if (String(u).includes("/api/insta")) {
-      return new Response(JSON.stringify({ video: [{ video: "https://scontent.cdninstagram.com/v.mp4" }] }), {
-        headers: { "content-type": "application/json" },
-      });
-    }
-    return new Response("BINARY", {
-      status: 200,
-      headers: { "content-type": "video/mp4", "content-length": "6", "accept-ranges": "bytes" },
-    });
-  };
-  try {
-    const res = await worker.fetch(
-      new Request("https://worker.example/api/v1/download?url=" + encodeURIComponent(url) + "&inline=1"),
-      e2,
-      ctx,
+    const res = await call(
+      "/api/v1/download?url=" + encodeURIComponent("https://www.instagram.com/reel/Inline1/") + "&inline=1",
+      undefined,
+      e,
     );
     assert.equal(res.status, 200);
     assert.equal(res.headers.get("content-disposition"), "inline");
     assert.equal(await res.text(), "BINARY");
   } finally {
-    globalThis.fetch = origFetch;
+    globalThis.fetch = orig;
   }
 });
 
-test("HEAD download does not consume the download quota", async () => {
+test("HEAD download advertises headers without consuming the quota", async () => {
   resetProviderState();
-  const e2 = { ...env, KV: kvStub(), RATE_LIMIT_DOWNLOAD_PER_MINUTE: "1" };
-  const url = "https://www.instagram.com/reel/Head1/";
-  const origFetch = globalThis.fetch;
-  globalThis.fetch = async (u) => {
-    if (String(u).includes("/api/insta")) {
-      return new Response(JSON.stringify({ video: [{ video: "https://scontent.cdninstagram.com/v.mp4" }] }), {
-        headers: { "content-type": "application/json" },
-      });
-    }
-    return new Response(null, {
-      status: 200,
-      headers: { "content-type": "video/mp4", "content-length": "6", "accept-ranges": "bytes" },
-    });
-  };
+  const e = { ...env, KV: kvStub(), RATE_LIMIT_DOWNLOAD_PER_MINUTE: "1" };
+  const orig = globalThis.fetch;
+  globalThis.fetch = mockUpstreamAndCdn("", { "content-length": "6" });
   try {
-    const head = await worker.fetch(
-      new Request("https://worker.example/api/v1/download?url=" + encodeURIComponent(url), { method: "HEAD" }),
-      e2,
-      ctx,
-    );
+    const p = "/api/v1/download?url=" + encodeURIComponent("https://www.instagram.com/reel/Head1/");
+    const head = await call(p, { method: "HEAD" }, e);
     assert.equal(head.status, 200);
-    // The single quota slot is still available for the real GET.
-    const get = await worker.fetch(new Request("https://worker.example/api/v1/download?url=" + encodeURIComponent(url)), e2, ctx);
+    assert.equal(await head.text(), "");
+    const get = await call(p, undefined, e);
     assert.equal(get.status, 200);
   } finally {
-    globalThis.fetch = origFetch;
+    globalThis.fetch = orig;
   }
 });
 
-test("thumbnail responses are never marked immutable", async () => {
-  const e2 = { ...env, KV: kvStub() };
-  const origFetch = globalThis.fetch;
+test("deep health reports provider reachability", async () => {
+  resetProviderState();
+  const e = { ...env, KV: kvStub() };
+  const orig = globalThis.fetch;
+  globalThis.fetch = async () => new Response("[]", { status: 200 });
+  try {
+    const res = await call("/health?deep=1", undefined, e);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.ok(Array.isArray(body.data.provider_live));
+    assert.equal(body.data.provider_live[0].reachable, true);
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
+test("thumbnail responses are private and never immutable", async () => {
+  const e = { ...env, KV: kvStub() };
+  const orig = globalThis.fetch;
   globalThis.fetch = async () => new Response("img", { status: 200, headers: { "content-type": "image/jpeg" } });
   try {
-    const res = await worker.fetch(
-      new Request(
-        "https://worker.example/api/v1/thumbnail?url=" + encodeURIComponent("https://scontent.cdninstagram.com/t.jpg"),
-      ),
-      e2,
-      ctx,
+    const res = await call(
+      "/api/v1/thumbnail?url=" + encodeURIComponent("https://scontent.cdninstagram.com/t.jpg"),
+      undefined,
+      e,
     );
     assert.equal(res.status, 200);
     const cc = res.headers.get("cache-control") || "";
+    assert.match(cc, /private/);
     assert.match(cc, /max-age=300/);
     assert.ok(!/immutable/.test(cc));
+    assert.equal(await res.text(), "img");
   } finally {
-    globalThis.fetch = origFetch;
+    globalThis.fetch = orig;
   }
 });
 
-test("a disabled API key is rejected with E_KEY_DISABLED", async () => {
-  const disabledEnv = {
-    ...env,
-    KV: kvStub(),
-    DB: d1Stub({ apiKey: { key_hash: "x", disabled: 1, limit_per_minute: 100 } }),
-  };
-  const res = await worker.fetch(
-    new Request("https://worker.example/api/v1/resolve?url=" + encodeURIComponent("https://www.instagram.com/reel/Key1/"), {
-      headers: { "x-api-key": "some-key-123" },
-    }),
-    disabledEnv,
-    ctx,
-  );
-  assert.equal(res.status, 409);
-  assert.equal((await res.json()).error.code, "E_KEY_DISABLED");
+test("API_KEYS makes /api/v1 private while / and /health stay public", async () => {
+  resetProviderState();
+  const e = { ...env, KV: kvStub(), API_KEYS: "key-one, key-two" };
+  const orig = globalThis.fetch;
+  globalThis.fetch = async () => upstreamJson({ image: ["https://scontent.cdninstagram.com/a.jpg"] });
+  try {
+    const root = await call("/", undefined, e);
+    assert.equal(root.status, 200);
+    assert.equal((await root.json()).data.auth_required, true);
+
+    const p = "/api/v1/resolve?url=" + encodeURIComponent("https://www.instagram.com/p/Key1/");
+    const missing = await call(p, undefined, e);
+    assert.equal(missing.status, 401);
+    assert.match(missing.headers.get("www-authenticate") || "", /Bearer/);
+    assert.equal((await missing.json()).error.code, "E_UNAUTHORIZED");
+
+    const wrong = await call(p, { headers: { "x-api-key": "nope" } }, e);
+    assert.equal(wrong.status, 401);
+
+    const bearer = await call(p, { headers: { authorization: "Bearer key-one" } }, e);
+    assert.equal(bearer.status, 200);
+
+    const header = await call(p, { headers: { "x-api-key": "key-two" } }, e);
+    assert.equal(header.status, 200);
+  } finally {
+    globalThis.fetch = orig;
+  }
 });
 
-test("admin key list never exposes hashes or keys", async () => {
-  const adminEnv = {
-    ...env,
-    KV: kvStub(),
-    ADMIN_TOKEN: "s3cret-token",
-    DB: d1Stub({ apiKeys: [{ label: "ci", limit_per_minute: 50, created_at: 1, disabled: 0 }] }),
+test("an upstream timeout is surfaced as 504 E_UPSTREAM_TIMEOUT", async () => {
+  resetProviderState();
+  const e = { ...env, KV: kvStub(), UPSTREAM_TIMEOUT_MS: "50" };
+  const orig = globalThis.fetch;
+  globalThis.fetch = async () => {
+    const err = new Error("timed out");
+    err.name = "TimeoutError";
+    throw err;
   };
-  const res = await worker.fetch(
-    new Request("https://worker.example/api/v1/admin/keys", {
-      headers: { authorization: "Bearer s3cret-token" },
-    }),
-    adminEnv,
-    ctx,
-  );
-  assert.equal(res.status, 200);
-  const body = await res.json();
-  assert.deepEqual(body.data.keys, [{ label: "ci", limit_per_minute: 50, created_at: 1, disabled: false }]);
-  assert.ok(!JSON.stringify(body).includes("key_hash"));
+  try {
+    const res = await call("/api/v1/resolve?url=" + encodeURIComponent("https://www.instagram.com/reel/Slow1/"), undefined, e);
+    assert.equal(res.status, 504);
+    assert.equal((await res.json()).error.code, "E_UPSTREAM_TIMEOUT");
+  } finally {
+    globalThis.fetch = orig;
+  }
 });
 
-test("openapi.json only accepts GET/HEAD", async () => {
-  const res = await call("/openapi.json", { method: "POST" });
+test("unknown sub-paths and unhandled methods never leak internals", async () => {
+  const res = await call("/api/v1/resolve", { method: "DELETE" });
   assert.equal(res.status, 405);
-  assert.equal((await res.json()).error.code, "E_METHOD");
+  const body = await res.json();
+  assert.equal(body.error.code, "E_METHOD");
+  assert.ok(!JSON.stringify(body).includes("stack"));
 });
-
-test("the HTML document is private/no-store and carries no unsafe-inline", async () => {
-  const res = await call("/?lang=en");
-  assert.equal(res.status, 200);
-  assert.equal(res.headers.get("cache-control"), "private, no-store");
-  assert.ok(!/unsafe-inline/.test(res.headers.get("content-security-policy") || ""));
-  await res.text();
-});
-

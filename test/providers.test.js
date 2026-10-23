@@ -11,9 +11,10 @@ import {
   providerHealthSnapshot,
   checkProviderHealth,
   tokenForProvider,
+  numericEnv,
 } from "../src/lib/providers.js";
 
-const ctx = { kind: "reel", shortcode: "Ab1", canonical: "https://www.instagram.com/reel/Ab1/" };
+const ctx = { kind: "reel", shortcode: "Ab12", canonical: "https://www.instagram.com/reel/Ab12/" };
 
 function jsonResponse(obj, status = 200) {
   return new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json" } });
@@ -72,13 +73,51 @@ test("circuit breaker opens after threshold failures", () => {
   resetProviderState();
 });
 
-test("parseUpstreams drops malformed and non-http entries", () => {
+test("parseUpstreams drops malformed, non-https and non-http entries", () => {
   assert.deepEqual(
-    parseUpstreams({ UPSTREAM_URLS: "ftp://a.example/x, not a url, https://ok.example/api" }),
+    parseUpstreams({ UPSTREAM_URLS: "ftp://a.example/x, not a url, http://plain.example/api, https://ok.example/api" }),
     ["https://ok.example/api"],
   );
-  // Nothing usable -> the safe default.
   assert.deepEqual(parseUpstreams({ UPSTREAM_URLS: "ftp://a.example/x" }), ["https://catplus.ir/api/insta"]);
+});
+
+test("invalid numeric env values fall back to safe defaults", () => {
+  assert.equal(numericEnv({ UPSTREAM_TIMEOUT_MS: "abc" }, "UPSTREAM_TIMEOUT_MS", 12000), 12000);
+  assert.equal(numericEnv({ UPSTREAM_TIMEOUT_MS: "0" }, "UPSTREAM_TIMEOUT_MS", 12000), 12000);
+  assert.equal(numericEnv({ UPSTREAM_TIMEOUT_MS: "2500" }, "UPSTREAM_TIMEOUT_MS", 12000), 2500);
+});
+
+test("a fetch timeout is E_UPSTREAM_TIMEOUT (HTTP 504), not E_PRIVATE_OR_NOT_FOUND", async () => {
+  resetProviderState();
+  const env = { UPSTREAM_URLS: "https://timeout.example/api" };
+  const fetchImpl = async () => {
+    const err = new Error("aborted");
+    err.name = "TimeoutError";
+    throw err;
+  };
+  await assert.rejects(
+    () => resolveContent(ctx, env, { fetchImpl, attempts: 1 }),
+    (e) => e.code === "E_UPSTREAM_TIMEOUT",
+  );
+});
+
+test("a timeout while reading the body is still a timeout", async () => {
+  resetProviderState();
+  const env = { UPSTREAM_URLS: "https://body-timeout.example/api" };
+  const fetchImpl = async () => ({
+    status: 200,
+    ok: true,
+    headers: new Headers({ "content-type": "application/json" }),
+    async text() {
+      const err = new Error("body aborted");
+      err.name = "TimeoutError";
+      throw err;
+    },
+  });
+  await assert.rejects(
+    () => resolveContent(ctx, env, { fetchImpl, attempts: 1 }),
+    (e) => e.code === "E_UPSTREAM_TIMEOUT",
+  );
 });
 
 test("a non-object JSON body is an upstream failure, not not-found", async () => {
@@ -140,3 +179,14 @@ test("a health check never mutates the breaker state", async () => {
   resetProviderState();
 });
 
+
+test("when every breaker is open the result is E_UPSTREAM_UNAVAILABLE", async () => {
+  resetProviderState();
+  const env = { UPSTREAM_URLS: "https://open.example/api" };
+  for (let i = 0; i < 3; i++) recordFailure("https://open.example/api");
+  await assert.rejects(
+    () => resolveContent(ctx, env, { fetchImpl: async () => jsonResponse({}), attempts: 1 }),
+    (e) => e.code === "E_UPSTREAM_UNAVAILABLE",
+  );
+  resetProviderState();
+});

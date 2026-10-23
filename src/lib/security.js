@@ -1,27 +1,26 @@
-// Security helpers for the download proxy: CDN allowlist, SSRF guards,
-// streaming with Range pass-through, a hard size cap, redirect validation and
-// body timeouts.
+// Security helpers for the media proxy: CDN allowlist, SSRF guards, streaming
+// with Range pass-through, a hard byte cap, redirect validation and body
+// timeouts.
 //
 // The proxy must never become an open relay:
 //   * https only, no credentials, port must be empty or 443;
-//   * loopback / private / link-local / CGNAT / IPv6 (incl. IPv4-mapped and
+//   * loopback / private / link-local / CGNAT / IPv6 (including IPv4-mapped and
 //     bracketed forms) hosts are blocked;
-//   * the host must match the CDN allowlist;
-//   * redirects are followed MANUALLY, every hop is re-validated and the
-//     number of hops is capped;
+//   * the host must match the CDN allowlist (Instagram/Facebook CDNs);
+//   * redirects are followed MANUALLY, every hop is re-validated and the number
+//     of hops is capped;
 //   * the body is capped by a real byte counter (not only by Content-Length);
 //   * the body has an idle and a total timeout;
-//   * only media MIME types are served inline, everything else is sandboxed
-//     and forced to download.
+//   * only media MIME types are proxied, and thumbnails must be images.
 
-const DEFAULT_ALLOWLIST = ["*.cdninstagram.com", "*.fbcdn.net", "*.instagram.com", "*.facebook.com"];
+const DEFAULT_ALLOWLIST = ["*.cdninstagram.com", "*.fbcdn.net"];
 
 const MAX_REDIRECT_HOPS = 3;
 const DEFAULT_MAX_BYTES = 80 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 20_000;
 const DEFAULT_IDLE_TIMEOUT_MS = 15_000;
 
-/** MIME types that may be rendered inline by the browser. */
+/** MIME types that a media proxy may serve. */
 export const MEDIA_MIME_ALLOWLIST = new Set([
   "image/jpeg",
   "image/pjpeg",
@@ -44,7 +43,7 @@ export const MEDIA_MIME_ALLOWLIST = new Set([
   "audio/wav",
 ]);
 
-/** MIME types that are never proxied at all (active content). */
+/** Active content: never proxied, even when a CDN mistakenly serves it. */
 export const DANGEROUS_MIME = new Set([
   "text/html",
   "application/xhtml+xml",
@@ -123,28 +122,21 @@ function isPrivateIPv4(host) {
 }
 
 function isPrivateIPv6(host) {
-  // Strip the zone id and normalise.
   const h = host.split("%")[0].toLowerCase();
   if (!h.includes(":")) return false;
   if (h === "::1" || h === "::") return true; // loopback / unspecified
   if (h === "64:ff9b::" || h === "64:ff9b::1") return true; // NAT64
-  // IPv4-mapped / IPv4-compatible forms: ::ffff:127.0.0.1
   const mapped = h.match(/^::(?:ffff:)?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
   if (mapped) return isPrivateIPv4(mapped[1]);
   const hexMapped = h.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
   if (hexMapped) {
     const hi = parseInt(hexMapped[1], 16);
     const lo = parseInt(hexMapped[2], 16);
-    const ip = `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`;
-    return isPrivateIPv4(ip);
+    return isPrivateIPv4(`${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`);
   }
-  // Any other ::/96 form (e.g. ::2) is reserved, never a public destination.
-  if (h.startsWith("::")) return true;
+  if (h.startsWith("::")) return true; // other ::/96 forms are reserved
 
-  // Inspect the first hextet for the special-purpose prefixes. This covers
-  // whole ranges (fc00::/7, fe80::/10, ff00::/8) instead of a single value.
-  const firstHex = h.split(":")[0] || "0";
-  const first = parseInt(firstHex, 16);
+  const first = parseInt(h.split(":")[0] || "0", 16);
   if (Number.isFinite(first)) {
     if ((first & 0xfe00) === 0xfc00) return true; // unique local fc00::/7
     if ((first & 0xffc0) === 0xfe80) return true; // link-local fe80::/10
@@ -158,7 +150,7 @@ function isPrivateIPv6(host) {
 export function looksPrivateHost(hostname) {
   const host = String(hostname || "")
     .toLowerCase()
-    .replace(/^\[|\]$/g, "") // IPv6 literals arrive bracketed
+    .replace(/^\[|\]$/g, "")
     .replace(/\.$/, "");
   if (!host) return true;
   if (PRIVATE_HOST_RE.test(host)) return true;
@@ -169,8 +161,8 @@ export function looksPrivateHost(hostname) {
 }
 
 /**
- * Validate that a URL is safe to proxy: https, default port, not private,
- * allowlisted host.
+ * Validate that a URL is safe to proxy: https, default port, not private and
+ * allowlisted.
  * @returns {{ok:true,url:URL}|{ok:false,code:string}}
  */
 export function validateProxyUrl(target, env, extraAllowlist = []) {
@@ -182,7 +174,6 @@ export function validateProxyUrl(target, env, extraAllowlist = []) {
   }
   if (url.protocol !== "https:") return { ok: false, code: "E_NOT_ALLOWED_HOST" };
   if (url.username || url.password) return { ok: false, code: "E_NOT_ALLOWED_HOST" };
-  // Only the default HTTPS port (empty or an explicit 443) is allowed.
   if (url.port && url.port !== "443") return { ok: false, code: "E_NOT_ALLOWED_HOST" };
   if (looksPrivateHost(url.hostname)) return { ok: false, code: "E_NOT_ALLOWED_HOST" };
   const patterns = [...parseAllowlist(env), ...normalizePatterns(extraAllowlist)];
@@ -205,7 +196,7 @@ export function maxBytes(env) {
   return Math.floor(n) * 1024 * 1024;
 }
 
-/** Rough size estimate for a variant, used to enforce the cap early. */
+/** Rough size estimate for a variant, used to reject early when advertised. */
 export function exceedsMaxSize(bytes, env) {
   if (!Number.isFinite(Number(bytes))) return false;
   return Number(bytes) > maxBytes(env);
@@ -215,6 +206,15 @@ function codedError(code, message) {
   const err = new Error(message || code);
   err.code = code;
   return err;
+}
+
+function normalizeContentType(value) {
+  if (!value) return "";
+  return String(value).split(";")[0].trim().toLowerCase();
+}
+
+function isMediaType(type) {
+  return Boolean(type) && MEDIA_MIME_ALLOWLIST.has(type) && !DANGEROUS_MIME.has(type);
 }
 
 /**
@@ -242,33 +242,36 @@ async function fetchWithValidatedRedirects(url, init, env, fetchImpl, extraAllow
   throw codedError("E_UPSTREAM_FAILED", "too_many_redirects");
 }
 
-function normalizeContentType(value) {
-  if (!value) return "";
-  return String(value).split(";")[0].trim().toLowerCase();
-}
-
 /**
- * Fetch a media URL as a stream with Range pass-through, a real size cap,
+ * Fetch a media URL as a stream with Range pass-through, a real byte cap,
  * redirect validation and body timeouts.
- * Returns a Response suitable to pass through to the client.
+ *
+ * Options:
+ *   - contentType: the MIME type the caller expects (from metadata);
+ *   - requireImage: reject anything that is not image/* (thumbnails);
+ *   - contentDisposition: full Content-Disposition value;
+ *   - inline: when true, serve `inline` instead of forcing a download;
+ *   - maxBytes / timeoutMs / idleTimeoutMs: test/operation overrides.
+ *
+ * @returns {Promise<Response>} a streamed response suitable to pass through.
  */
 export async function streamMedia(targetUrl, request, env, options = {}) {
   const check = validateProxyUrl(targetUrl, env, options.extraAllowlist);
-  if (!check.ok) {
-    throw codedError(check.code, check.code);
-  }
+  if (!check.ok) throw codedError(check.code, check.code);
 
   const fetchImpl = options.fetchImpl || fetch;
   const timeoutMs = Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : DEFAULT_TIMEOUT_MS;
   const idleTimeoutMs = Number(options.idleTimeoutMs) > 0 ? Number(options.idleTimeoutMs) : DEFAULT_IDLE_TIMEOUT_MS;
   const limit = options.maxBytes || maxBytes(env);
+  const expectedType = normalizeContentType(options.contentType);
 
   const controller = new AbortController();
-  const totalTimer = setTimeout(() => controller.abort(), timeoutMs);
+  const abort = () => controller.abort(codedError("E_UPSTREAM_TIMEOUT", "timeout"));
+  const totalTimer = setTimeout(abort, timeoutMs);
   let idleTimer = null;
   const resetIdle = () => {
     if (idleTimer) clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => controller.abort(), idleTimeoutMs);
+    idleTimer = setTimeout(abort, idleTimeoutMs);
   };
   resetIdle();
 
@@ -295,6 +298,9 @@ export async function streamMedia(targetUrl, request, env, options = {}) {
     clearTimeout(totalTimer);
     if (idleTimer) clearTimeout(idleTimer);
     if (e && e.code) throw e;
+    if (e && (e.name === "TimeoutError" || e.name === "AbortError")) {
+      throw codedError("E_UPSTREAM_TIMEOUT", "timeout");
+    }
     throw codedError("E_UPSTREAM_FAILED", "upstream_failed");
   }
 
@@ -303,11 +309,11 @@ export async function streamMedia(targetUrl, request, env, options = {}) {
     if (idleTimer) clearTimeout(idleTimer);
   };
 
-  // A conditional request that the upstream confirms: no body, no count.
+  // A conditional request that the upstream confirms: no body.
   if (upstream.status === 304) {
     cleanup();
     const headers = new Headers();
-    for (const h of ["etag", "last-modified", "cache-control"]) {
+    for (const h of ["etag", "last-modified"]) {
       const v = upstream.headers.get(h);
       if (v) headers.set(h, v);
     }
@@ -331,11 +337,18 @@ export async function streamMedia(targetUrl, request, env, options = {}) {
   }
 
   const upstreamType = normalizeContentType(upstream.headers.get("content-type"));
-  if (DANGEROUS_MIME.has(upstreamType)) {
+  const declaredType = normalizeContentType(options.contentType);
+  // Only a verified media type may pass. An empty upstream type is accepted
+  // only when the caller supplied a media type from metadata.
+  const effectiveType = upstreamType || declaredType;
+  if (!isMediaType(effectiveType) || (upstreamType && !isMediaType(upstreamType))) {
     cleanup();
-    throw codedError("E_NOT_ALLOWED_TYPE", "dangerous_mime");
+    throw codedError("E_NOT_ALLOWED_TYPE", "dangerous_or_non_media_mime");
   }
-  const isMedia = MEDIA_MIME_ALLOWLIST.has(upstreamType);
+  if (options.requireImage && !effectiveType.startsWith("image/")) {
+    cleanup();
+    throw codedError("E_NOT_ALLOWED_TYPE", "not_an_image");
+  }
 
   const declared = contentLengthFromHeaders(upstream.headers);
   if (declared !== undefined && declared > limit) {
@@ -346,35 +359,25 @@ export async function streamMedia(targetUrl, request, env, options = {}) {
   const isHead = request.method === "HEAD";
 
   const headers = new Headers();
-  for (const h of ["content-type", "content-range", "accept-ranges", "etag", "last-modified"]) {
+  for (const h of ["content-range", "accept-ranges", "etag", "last-modified"]) {
     const v = upstream.headers.get(h);
     if (v) headers.set(h, v);
   }
-  // content-encoding is never forwarded: the body we hand out is the plain
-  // (decoded) stream, so keeping the header would break the client.
+  headers.set("content-type", effectiveType);
   if (declared !== undefined && upstream.status !== 206) headers.set("content-length", String(declared));
   headers.set("cache-control", "private, max-age=300");
   headers.set("x-content-type-options", "nosniff");
   if (!headers.has("accept-ranges")) headers.set("accept-ranges", "bytes");
-  if (options.contentType) headers.set("content-type", options.contentType);
-  if (!isMedia) {
-    // Anything that is not a known media type is sandboxed and forced to
-    // download instead of being rendered in the origin.
-    headers.set("content-security-policy", "sandbox; default-src 'none'");
-    headers.set("content-disposition", options.contentDisposition || "attachment");
-    if (!headers.has("content-type")) headers.set("content-type", "application/octet-stream");
-  } else if (options.contentDisposition) {
+  if (options.contentDisposition) {
     headers.set("content-disposition", options.contentDisposition);
   } else if (options.inline) {
-    // In-page playback: the browser may render the media directly.
     headers.set("content-disposition", "inline");
+  } else {
+    headers.set("content-disposition", "attachment");
   }
-  // Media is same-origin only: no permissive CORS on binary responses.
-  applyMediaCors(headers, request);
 
   if (isHead || !upstream.body) {
     cleanup();
-    // Never keep the upstream body alive for a HEAD request.
     if (upstream.body) {
       try {
         await upstream.body.cancel();
@@ -400,7 +403,6 @@ export async function streamMedia(targetUrl, request, env, options = {}) {
           controller.enqueue(chunk);
         },
         flush() {
-          // The body ended normally: stop the timers.
           cleanup();
         },
         cancel() {
@@ -408,7 +410,7 @@ export async function streamMedia(targetUrl, request, env, options = {}) {
         },
       }),
     );
-  } catch (e) {
+  } catch {
     cleanup();
     throw codedError("E_UPSTREAM_FAILED", "stream_failed");
   }
@@ -418,32 +420,4 @@ export async function streamMedia(targetUrl, request, env, options = {}) {
     statusText: upstream.statusText,
     headers,
   });
-}
-
-/**
- * Media responses are same-origin only. A permissive `*` would let any site
- * embed the proxied bytes, so CORS is granted only when the request comes
- * from the worker's own origin.
- */
-export function applyMediaCors(headers, request) {
-  try {
-    const origin = request.headers.get("origin");
-    if (!origin) return;
-    const self = new URL(request.url).origin;
-    if (origin === self) {
-      headers.set("access-control-allow-origin", origin);
-      headers.set("vary", "Origin");
-    }
-  } catch {
-    // ignore
-  }
-}
-
-export function escapeHtml(value) {
-  return String(value == null ? "" : value)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
 }
